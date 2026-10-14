@@ -1,9 +1,11 @@
 [![Build Arduino Sketch](https://github.com/ThePylaa/wiener_linien_CYD_monitor/actions/workflows/main.yml/badge.svg)](https://github.com/ThePylaa/wiener_linien_CYD_monitor/actions/workflows/main.yml)
 # Wiener Linien ESP32 Public Transport Departure Monitor (Cheap Yellow Display / CYD)
 
-**Brief description:** A real-time public transport departure monitor for the **ESP32-2432S028R "Cheap Yellow Display" (CYD)**. It shows a live countdown to the next Wiener Linien departures and lets you save **up to 20 stops** and tap the touchscreen to switch between them. Based on open data from the City of Vienna provided by Wiener Linien. (Data source: City of Vienna - https://data.wien.gv.at)
+> **Credit:** This project is based on the original **[Wiener Linien ESP32 Monitor](https://github.com/coppermilk/wiener_linien_esp32_monitor)** by **[coppermilk](https://github.com/coppermilk)**, built for the LILYGO T-Display-S3. Thank you for the idea and the groundwork! ❤️
+>
+> This fork ports it to the cheap, widely available ESP32-2432S028R board and adds multi-stop support, touch switching, battery saving and a web setup app with a stop and line browser.
 
-> **Note:** This is a fork/port of the original [LILYGO T-Display-S3 project](https://github.com/coppermilk/wiener_linien_esp32_monitor) adapted for the cheap, widely-available ESP32-2432S028R board, with added multi-stop support and touch switching.
+**Brief description:** A real-time public transport departure monitor for the **ESP32-2432S028R "Cheap Yellow Display" (CYD)**. It shows a live countdown to the next Wiener Linien departures and lets you save **up to 20 stops** and tap the touchscreen to switch between them. Based on open data from the City of Vienna provided by Wiener Linien. (Data source: City of Vienna - https://data.wien.gv.at)
 
 ![Line notification](img/notification2.gif)
 
