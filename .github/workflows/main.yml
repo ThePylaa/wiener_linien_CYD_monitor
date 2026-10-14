@@ -8,30 +8,21 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
 
-      # We use the `arduino/setup-arduino-cli` action to install and
-      # configure the Arduino CLI on the system.
-      - name: Setup Arduino CLI
-        uses: arduino/setup-arduino-cli@v1
-     # - name: Install Arduino CLI
-     #   run: |
-     #     curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | BINDIR=/usr/local/bin sh
-     #   shell: bash
-
-      - name: Install required libraries
-        run: |
-          arduino-cli lib install "ArduinoJson"
-          arduino-cli lib install "TFT_eSPI"
-          arduino-cli lib install "WiFiManager"
-        shell: bash
-        
       - uses: arduino/compile-sketches@v1
         with:
-          fqbn: "esp32:esp32:tinypico"
+          # ESP32-2432S028R "Cheap Yellow Display" is a plain ESP32-WROOM board.
+          # The sketch needs the "Huge APP" partition (it exceeds the default
+          # 1.2 MB app partition).
+          fqbn: "esp32:esp32:esp32:PartitionScheme=huge_app"
           platforms: |
             - name: esp32:esp32
-              source-url: https://dl.espressif.com/dl/package_esp32_index.json
-
+              source-url: https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          libraries: |
+            - name: ArduinoJson
+            - name: TFT_eSPI
+            - name: WiFiManager
+            - name: XPT2046_Touchscreen
           sketch-paths: |
             - sketch

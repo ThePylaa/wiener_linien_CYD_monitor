@@ -1,27 +1,85 @@
-#include <ArduinoJson.h>  // by Benoit Blanchon 6.21.3
+#include <ArduinoJson.h>  // by Benoit Blanchon 7.x
+#include <algorithm>
+#include <driver/gpio.h>
+#include <esp_sleep.h>
 #include <esp_task_wdt.h>
+#include <ESPmDNS.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <FS.h>
 #include <HTTPClient.h>
 #include <limits>
 #include <map>
+#include <memory>
 #include <SPIFFS.h>
 #include <SPI.h>
-#include <TFT_eSPI.h>  // by Bodmer 2.5.0 installed manual
+#include <TFT_eSPI.h>            // by Bodmer 2.5.x
+#include <time.h>
 #include <unordered_map>
 #include <vector>
-#include <WiFiManager.h>  // by tzapu 2.0.16
+#include <WebServer.h>
+#include <WiFiManager.h>         // by tzapu 2.0.17
+#include <WiFiClientSecure.h>
+#include <XPT2046_Touchscreen.h> // by Paul Stoffregen 1.4
 
+// The ESP32 Arduino core (3.x) ships Espressif's QR code encoder. When it is
+// available the setup screens show a scannable code; otherwise text only.
+#if __has_include(<qrcode.h>)
+#include <qrcode.h>
+#endif
+#if defined(ESP_QRCODE_CONFIG_DEFAULT)
+#define HAS_ESP_QRCODE 1
+#else
+#define HAS_ESP_QRCODE 0
+#endif
+
+#include "setup_page.h"
+
+#define ENABLE_SERIAL_LOGS 1
 //#define DEBUG_SERIAL_WIEN_MONITOR 0
 #define TFT_BG tft.color565(0, 5, 0)
 #define TFT_TEXT tft.color565(255, 240, 93)
-#define URL_BASE \
-  "https://www.wienerlinien.at/ogd_realtime/monitor?" \
-  "activateTrafficInfo=stoerunglang&rbl="
+#define TFT_ACCENT tft.color565(64, 158, 141)
+#define MONITOR_URL "https://www.wienerlinien.at/ogd_realtime/monitor?"
+#define OGD_URL "https://www.wienerlinien.at/ogd_realtime/doku/ogd/"
+#define STOPS_INDEX_URL OGD_URL "wienerlinien-ogd-haltepunkte.csv"
+#define LINES_URL OGD_URL "wienerlinien-ogd-linien.csv"
+#define ROUTES_URL OGD_URL "wienerlinien-ogd-fahrwegverlaeufe.csv"
 #define JSON_CONFIG_FILE "/sample_config.json"
+#define STOPS_INDEX_FILE "/stops.csv"
+#define STOPS_INDEX_TMP_FILE "/stops.tmp"
+#define LINES_INDEX_FILE "/lines.csv"
+#define LINES_INDEX_TMP_FILE "/lines.tmp"
+#define DEVICE_HOSTNAME "wien-monitor"
 
-// Forvard declaration
+// ----------------------------------------------------------------------------
+// ESP32-2432S028R "Cheap Yellow Display" (CYD) hardware.
+//
+// The 2.8" ILI9341 panel is driven by TFT_eSPI (see User_Setup.h in the repo
+// root). The XPT2046 resistive touch controller sits on a SEPARATE SPI bus, so
+// it needs its own SPIClass instance and the XPT2046_Touchscreen library - it
+// cannot share the display bus that TFT_eSPI uses.
+// ----------------------------------------------------------------------------
+#define XPT2046_IRQ 36
+#define XPT2046_MOSI 32
+#define XPT2046_MISO 39
+#define XPT2046_CLK 25
+#define XPT2046_CS 33
+
+// Raw touch values that map to the screen edges (rough, good enough to tell the
+// left half from the right half of the panel).
+#define TOUCH_RAW_MIN 300
+#define TOUCH_RAW_MAX 3800
+
+#ifndef TFT_BL
+#define TFT_BL 21
+#endif
+
+#ifndef TFT_BACKLIGHT_ON
+#define TFT_BACKLIGHT_ON HIGH
+#endif
+
+// Forward declaration
 class Screen;
 class TraficManager;
 class TraficClock;
@@ -31,22 +89,61 @@ struct ConfigFileHandler;
 struct GlobalSettings;
 struct Monitor;
 struct ScreenEntity;
+struct StopHit;
+struct StopIndexInfo;
+struct DisplayPrefs;
 struct StringDatase;
 
-std::vector<Monitor> GetMonitorsFromJson(const String&);
+std::vector<Monitor> GetMonitorsFromJson(JsonDocument&);
 std::vector<Monitor> GetFilteredMonitors(const std::vector<Monitor>&, const String&);
 std::vector<String> GetSplittedStrings(String, char);
 String FixJsonMistake(String);
+String TitleCaseSingleWord(String);
 String GetRandomString(int);
-String GetJson(const String&);
+bool HttpGetJson(const String&, JsonDocument&, const char*, String&);
+bool FetchDepartures(const String&, std::vector<Monitor>&);
 template<typename T> std::vector<T> cyclicSubset(const std::vector<T>&, size_t, size_t);
 void PrintSystemInfo();
 void PrintDebugMonitor(const Monitor&);
+void PrintDegbugMonitors(const Monitor&);
 void PrintDegbugMonitors(const std::vector<Monitor>&);
+void LogInfo(const __FlashStringHelper*, const String& = "");
+void LogWarn(const __FlashStringHelper*, const String& = "");
+void LogError(const __FlashStringHelper*, const String& = "");
+void LogProfile(const Config&, int);
+bool CreateTaskChecked(TaskFunction_t, const char*, uint32_t, UBaseType_t);
+void ConfigureClock();
+String GetClockText();
+void DrawHeaderBar();
+void BacklightBegin();
+void BacklightSetPct(int);
+void SetDisplayAwake(bool);
+bool WakeDisplayIfNeeded();
+void EnterDisplaySleepPowerSave();
+void ExitDisplaySleepPowerSave();
+void SleepUntilDisplayWakes();
+void RememberWifiLink();
+void RestartMdns();
+String GetActiveStopDisplayName();
+void ShowFetchingStopScreen(const Config&);
+bool GetCachedTraffic(int, std::vector<Monitor>&);
+void SaveTrafficCache(int, const std::vector<Monitor>&);
+void ClearTrafficCache();
+void ShowStatusScreen(const String&, const String& = "");
+void DrawSetupScreen();
+void ShowSetupScreen();
+void CloseSetupScreen();
+void DrawWifiPortalScreen();
+int DrawQrCode(const String&, int, int, int);
+bool StartRuntimeConfigPortal();
 void ResetActionsTask(void*);
 void ScreenUpdateTask(void*);
 void UpdateDataTask(void*);
-void WiFiManagerTask();
+void RuntimeConfigPortalTask(void*);
+void TouchTask(void*);
+void WebTask(void*);
+void WiFiManagerTask(bool force_config_portal = false);
+void ApplyProfileChange();
 
 // Global variables
 SemaphoreHandle_t dataMutex;
@@ -54,127 +151,65 @@ TFT_eSPI tft = TFT_eSPI();
 Screen* p_screen = nullptr;
 TraficManager* pTraficManager = nullptr;
 
+// The XPT2046 touch controller lives on its own SPI bus on the CYD board. The
+// library polls it over SPI; its IRQ line (pen-down, active low) is left to us
+// so it can wake the chip from light sleep.
+SPIClass touchSPI = SPIClass(VSPI);
+XPT2046_Touchscreen ts(XPT2046_CS);
+
+// Set by the touch handler when the active stop changes so UpdateDataTask can
+// refetch immediately instead of waiting out its normal sleep interval.
+volatile bool g_force_refresh = false;
+String g_last_data_error;
+bool g_status_screen_visible = false;
+bool g_force_header_redraw = true;
+volatile bool g_config_portal_open = false;
+volatile bool g_display_awake = true;
+volatile bool g_backlight_dimmed = false;
+volatile unsigned long g_last_touch_ms = 0;
+// Last request to the setup web app; keeps the display (and WiFi) awake while
+// someone is configuring it from their phone.
+volatile unsigned long g_last_web_ms = 0;
+// Set when a touch woke the chip from light sleep, so that same touch is not
+// also treated as a tap once the finger lifts.
+volatile bool g_ignore_touch_until_release = false;
+// The on-device setup screen (QR code + address) is showing.
+volatile bool g_setup_screen_visible = false;
+// Bumped on every stop switch/config change so an in-flight fetch for the old
+// stop is not shown for the new one.
+volatile uint32_t g_profile_generation = 0;
+// Handshake between the web server task and the WiFi portal (both need port 80).
+volatile bool g_web_server_stopped = true;
+volatile bool g_request_wifi_portal = false;
+
+// Survives a software reset: set before the scheduled maintenance reboot so the
+// device comes back up with the display still off instead of lighting it up.
+RTC_NOINIT_ATTR uint32_t g_quiet_boot_magic;
+static constexpr uint32_t kQuietBootMagic = 0x51E3B007;
+
 
 /**
  * @struct StringDatabase
  *
- * @brief A utility struct for managing string prompts and instructions.
+ * @brief Shared user-facing strings.
  */
 struct StringDatabase {
-private:
   /**
-     * @brief The prompt for finding RBL/Stop ID.
-     */
-  const static constexpr char* RBLPrompt =
-    "Find your RBL on https://till.mabe.at/rbl/."
-    "<br>Example: \"49\".<br><br><b>RBL/Stop ID:</b>";
-
-  /**
-     * @brief The prompt for filtering lines.
-     */
-  const static constexpr char* LineFilterPrompt =
-    "<i>Optional.</i>"
-    "Filter the lines to show by comma-separating the directions."
-    "If empty, all directions will be shown.<br>"
-    "Example: \"D,2,U2Z\".<br><br>"
-    "<b>Filter lines:</b>";
-
-public:
-  /**
-     * @brief Get the Wi-Fi SSID string.
-     * @return The Wi-Fi SSID string.
+     * @brief Name of the Wi-Fi hotspot the device opens for Wi-Fi setup.
      */
   static String GetWiFissid() {
-    return "Wien Transport 🚇⏱️";
-  }
-
-  /**
-     * @brief Get the instructions text.
-     * @return The instructions text.
-     */
-  static String GetInstructionsText() {
-    String instruction_start =
-      "Wait a few seconds or:\n"
-      "1) Take a smartphone.\n"
-      "2) Connect to Wi-Fi:\n"
-      " \"";
-    String instruction_end = "\"\n3) And follow prompts. (^_^)\n";
-    return instruction_start + GetWiFissid() + instruction_end;
-  }
-
-  /**
-     * @brief Get the RBL/Stop ID prompt.
-     * @return The RBL/Stop ID prompt.
-     */
-  static String GetRBLPrompt() {
-    return String(RBLPrompt);
-  }
-
-  /**
-     * @brief Get the line filter prompt.
-     * @return The line filter prompt.
-     */
-  static String GetLineFilterPrompt() {
-    return String(LineFilterPrompt);
-  }
-
-  /**
-     * @brief Get the prompt for specifying the number of lines to show.
-     * @param min The minimum number of lines.
-     * @param max The maximum number of lines.
-     * @param def The default number of lines.
-     * @return The prompt for specifying the number of lines to show.
-     */
-  static String GetLineCountPrompt(int min, int max, int def) {
-    String range = GetFormatRange(min, max);
-    String result =
-      "How many shown depatures do you want to show at the same time on monitor "
-      + range + "? (Default: "
-      + String(def) + "). <br>"
-                      "Example: \""
-      + String(def) + "\".<br><br>"
-                      "<b>Lines to show:</b>";
-    return result;
-  }
-
-private:
-  /**
-     * @brief Format a range of values as a string.
-     * @param min The minimum value.
-     * @param max The maximum value.
-     * @return The formatted range string.
-     *
-     * Example: GetFormatRange(1, 3) returns "1, 2, or 3".
-     */
-  static String GetFormatRange(int min, int max) {
-    if (min > max) {
-      // Swap min and max if min is greater than max
-      int temp = min;
-      min = max;
-      max = temp;
-    }
-
-    String result = "";
-
-    if (min == max) {
-      result += String(min);
-    } else if (max - min == 1) {
-      result += String(min) + " or " + String(max);
-    } else {
-      for (int i = min; i < max; i++) {
-        result += String(i) + ", ";
-      }
-      result += "or " + String(max);
-    }
-
-    return result;
+    return "Wien Transport";
   }
 };
 
 struct Config {
   static const int cnt_min_lines = 1;
-  static const int cnt_max_lines = 3;
+  // The CYD's 320x240 panel is taller than the original T-Display-S3, so it
+  // comfortably fits an extra departure row.
+  static const int cnt_max_lines = 4;
   static const int cnt_default_lines = 2;
+  ///< Most platforms (RBL IDs) one stop profile may combine.
+  static const int kMaxRblIds = 6;
 
   /**
      * @brief Default constructor.
@@ -194,7 +229,10 @@ struct Config {
   Config(const Config& other)
     : cnt_lines(other.cnt_lines),
       lines_filter(other.lines_filter),
-      lines_rbl(other.lines_rbl) {}
+      lines_rbl(other.lines_rbl),
+      name(other.name),
+      diva(other.diva),
+      badges(other.badges) {}
   /**
      * @brief Assignment operator.
      *
@@ -208,6 +246,9 @@ struct Config {
       lines_filter = other.lines_filter;
       lines_rbl = other.lines_rbl;
       cnt_lines = other.cnt_lines;
+      name = other.name;
+      diva = other.diva;
+      badges = other.badges;
     }
     return *this;
   }
@@ -223,7 +264,10 @@ struct Config {
   bool operator==(const Config& other) const {
     return lines_filter == other.lines_filter
            && lines_rbl == other.lines_rbl
-           && cnt_lines == other.cnt_lines;
+           && cnt_lines == other.cnt_lines
+           && name == other.name
+           && diva == other.diva
+           && badges == other.badges;
   }
   /**
      * @brief Inequality operator.
@@ -286,6 +330,7 @@ struct Config {
      */
   void SetLinesFilter(const String& str) {
     lines_filter = str;
+    lines_filter.trim();
   }
   /**
      * @brief Gets the lines filter as a string.
@@ -297,12 +342,36 @@ struct Config {
   }
 
   /**
-     * @brief Sets the lines RBL.
+     * @brief Sets the stop's RBL / stop ID(s).
      *
-     * @param str The lines RBL to set.
+     * One profile may combine several platforms (e.g. both directions of a
+     * line), so this accepts a list separated by commas, spaces or semicolons
+     * and stores it normalised as "4111,4118". Anything but digits is dropped.
+     *
+     * @param str The RBL list to set.
      */
   void SetLinesRBL(const String& str) {
-    lines_rbl = str;
+    lines_rbl = "";
+    int ids = 0;
+    bool in_number = false;
+    for (size_t i = 0; i < str.length(); ++i) {
+      const char c = str[i];
+      if (isdigit(static_cast<unsigned char>(c))) {
+        if (!in_number) {
+          if (ids == kMaxRblIds) {
+            break;
+          }
+          if (ids > 0) {
+            lines_rbl += ',';
+          }
+          ++ids;
+          in_number = true;
+        }
+        lines_rbl += c;
+      } else {
+        in_number = false;
+      }
+    }
   }
   /**
      * @brief Sets the lines RBL.
@@ -320,13 +389,60 @@ struct Config {
   const String& GetLinesRblAsString() const {
     return lines_rbl;
   }
+
   /**
-     * @brief Gets the lines RBL as an integer.
+     * @brief Sets the human-readable name of this stop profile.
      *
-     * @return The lines RBL as an integer.
+     * @param str The name to set (shown briefly when switching stops).
      */
-  int GetLinesRblAsInt() {
-    return lines_rbl.toInt();
+  void SetName(const String& str) {
+    name = str;
+    name.trim();
+  }
+  /**
+     * @brief Gets the human-readable name of this stop profile.
+     *
+     * @return The profile name as a string.
+     */
+  const String& GetName() const {
+    return name;
+  }
+
+  /**
+     * @brief Station (DIVA) this profile was picked from in the setup app.
+     *
+     * Only used by the web app to offer the direction picker again when the
+     * stop is edited; the display itself works from the RBL list.
+     */
+  void SetDiva(const String& str) {
+    diva = str;
+    diva.trim();
+  }
+  const String& GetDiva() const {
+    return diva;
+  }
+
+  /**
+     * @brief Line names shown as badges in the setup app, e.g. "U1,13A".
+     */
+  void SetBadges(const String& str) {
+    badges = str;
+    badges.trim();
+  }
+  const String& GetBadges() const {
+    return badges;
+  }
+
+  /**
+     * @brief Whether this profile points at a real stop.
+     *
+     * A profile with an empty RBL/Stop ID is treated as an unused slot and is
+     * skipped when cycling between stops.
+     *
+     * @return True if the profile has an RBL/Stop ID, false otherwise.
+     */
+  bool IsConfigured() const {
+    return lines_rbl.length() > 0;
   }
 
 private:
@@ -359,7 +475,65 @@ private:
 
   ///< The lines RBL.
   String lines_rbl;
+
+  ///< Optional human-readable name for this stop. Example "Home".
+  String name;
+
+  ///< Station ID the stop was picked from (setup app metadata only).
+  String diva;
+
+  ///< Line names for the setup app's badges (metadata only).
+  String badges;
 };
+
+////< Number of stop profiles the user can save and cycle between via touch.
+static constexpr int kProfileCount = 20;
+
+/**
+ * @brief Display and battery preferences, editable from the setup web app.
+ */
+struct DisplayPrefs {
+  ///< Backlight brightness while in use, in percent (10-100).
+  int brightness_pct = 100;
+  ///< Dim the backlight after this many seconds without touch (0 = never).
+  int dim_after_s = 20;
+  ///< Turn the display, WiFi and CPU off after this many idle seconds
+  ///< (0 = never). This is by far the biggest battery saver.
+  int off_after_s = 60;
+
+  void Clamp() {
+    brightness_pct = constrain(brightness_pct, 10, 100);
+    dim_after_s = constrain(dim_after_s, 0, 3600);
+    off_after_s = constrain(off_after_s, 0, 3600);
+  }
+
+  /**
+     * @brief Backlight level used while dimmed (never brighter than normal).
+     */
+  int DimmedPct() const {
+    return std::max(4, brightness_pct / 5);
+  }
+
+  bool operator==(const DisplayPrefs& other) const {
+    return brightness_pct == other.brightness_pct
+           && dim_after_s == other.dim_after_s
+           && off_after_s == other.off_after_s;
+  }
+};
+
+/**
+ * @brief Reads a JSON value that older firmware stored as a string ("2") and
+ * newer firmware stores as a number (2).
+ */
+int JsonToInt(JsonVariantConst value, int fallback) {
+  if (value.is<int>()) {
+    return value.as<int>();
+  }
+  if (value.is<const char*>()) {
+    return String(value.as<const char*>()).toInt();
+  }
+  return fallback;
+}
 
 /**
  * @brief Class for handling configuration files.
@@ -369,116 +543,147 @@ private:
  */
 struct ConfigFileHandler {
   /**
-     * @brief Saves the configuration file to SPIFFS.
+     * @brief Saves all stop profiles and display preferences to SPIFFS.
      *
-     * @param cfg The configuration to save.
+     * @param profiles The list of stop profiles to save.
+     * @param prefs The display/battery preferences to save.
      */
-  static void SaveConfigFile(Config& cfg) {
-#ifdef DEBUG_SERIAL_WIEN_MONITOR
-    Serial.println(F("Saving config"));
-#endif
-    StaticJsonDocument<512> json;
-    json["lines_filter"] = cfg.GetLinesFilterAsString();
-    json["rbl_id"] = cfg.GetLinesRblAsString();
-    json["lines_count"] = cfg.GetLinesCountAsString();
+  static void SaveConfigFile(const std::vector<Config>& profiles,
+                             const DisplayPrefs& prefs) {
+    LogInfo(F("config-save-start"),
+            "profiles=" + String(static_cast<int>(profiles.size())));
+    JsonDocument json;
+    JsonArray arr = json["profiles"].to<JsonArray>();
+    for (const auto& cfg : profiles) {
+      JsonObject obj = arr.add<JsonObject>();
+      obj["name"] = cfg.GetName();
+      obj["lines_filter"] = cfg.GetLinesFilterAsString();
+      obj["rbl_id"] = cfg.GetLinesRblAsString();
+      obj["lines_count"] = cfg.GetLinesCountAsInt();
+      if (cfg.GetDiva().length()) {
+        obj["diva"] = cfg.GetDiva();
+      }
+      if (cfg.GetBadges().length()) {
+        obj["badges"] = cfg.GetBadges();
+      }
+    }
+    JsonObject display = json["display"].to<JsonObject>();
+    display["brightness"] = prefs.brightness_pct;
+    display["dim_after_s"] = prefs.dim_after_s;
+    display["off_after_s"] = prefs.off_after_s;
 
     File file_config = SPIFFS.open(JSON_CONFIG_FILE, "w");
     if (!file_config) {
-      Serial.println("failed to open config file for writing");
+      LogError(F("config-open-write-failed"));
+      return;
     }
 
-    serializeJsonPretty(json, Serial);
-    if (serializeJson(json, file_config) == 0) {
 #ifdef DEBUG_SERIAL_WIEN_MONITOR
-      Serial.println(F("Failed to write to file"));
+    serializeJsonPretty(json, Serial);
 #endif
+    if (serializeJson(json, file_config) == 0) {
+      LogError(F("config-write-failed"));
+    } else {
+      LogInfo(F("config-save-ok"));
     }
     file_config.close();
   }
 
   /**
-     * @brief Loads the configuration file from SPIFFS.
+     * @brief Loads all stop profiles and display preferences from SPIFFS.
      *
-     * @param cfg The configuration to load into.
-     * @return True if the config file was loaded successfully, false otherwise.
+     * Accepts both the array format (`{"profiles":[...]}`) and the legacy
+     * single-stop format so existing devices keep their settings after an
+     * update.
+     *
+     * @param profiles The list to load profiles into (cleared on success).
+     * @param prefs Filled from the file when present; left untouched otherwise.
+     * @return True if at least one profile was loaded, false otherwise.
      */
-  static bool LoadConfigFile(Config& cfg) {
-    // clean FS, for testing
-    // SPIFFS.format();
-    // read configuration from FS json
-#ifdef DEBUG_SERIAL_WIEN_MONITOR
-    Serial.println("mounting FS...");
-#endif
+  static bool LoadConfigFile(std::vector<Config>& profiles,
+                             DisplayPrefs& prefs) {
+    LogInfo(F("spiffs-mount-start"));
 
     if (SPIFFS.begin(false) || SPIFFS.begin(true)) {
-#ifdef DEBUG_SERIAL_WIEN_MONITOR
-      Serial.println("mounted file system");
-#endif
+      LogInfo(F("spiffs-mounted"));
       if (SPIFFS.exists(JSON_CONFIG_FILE)) {
         // file exists, reading and loading
-#ifdef DEBUG_SERIAL_WIEN_MONITOR
-        Serial.println("reading config file");
-#endif
+        LogInfo(F("config-read-start"));
         File configFile = SPIFFS.open(JSON_CONFIG_FILE, "r");
         if (configFile) {
-#ifdef DEBUG_SERIAL_WIEN_MONITOR
-          Serial.println("opened config file");
-#endif
-          StaticJsonDocument<512> json;
+          JsonDocument json;
           DeserializationError error = deserializeJson(json, configFile);
+#ifdef DEBUG_SERIAL_WIEN_MONITOR
           serializeJsonPretty(json, Serial);
+#endif
+          configFile.close();
           if (!error) {
-#ifdef DEBUG_SERIAL_WIEN_MONITOR
-            Serial.println("\nparsed json");
-#endif
-
-            cfg.SetLinesFilter(json["lines_filter"].as<String>());
-            cfg.SetLinesRBL(json["rbl_id"].as<String>());
-            cfg.SetLinesCount(json["lines_count"].as<String>());
-            Serial.println("\nparsed json end");
-            return true;
+            profiles.clear();
+            auto read_profile = [](JsonVariantConst obj) {
+              Config cfg;
+              cfg.SetName(obj["name"] | "");
+              cfg.SetLinesFilter(obj["lines_filter"] | "");
+              cfg.SetLinesRBL(obj["rbl_id"] | "");
+              cfg.SetLinesCount(
+                JsonToInt(obj["lines_count"], Config::cnt_default_lines));
+              cfg.SetDiva(obj["diva"] | "");
+              cfg.SetBadges(obj["badges"] | "");
+              return cfg;
+            };
+            if (json["profiles"].is<JsonArray>()) {
+              for (JsonVariantConst obj : json["profiles"].as<JsonArrayConst>()) {
+                profiles.push_back(read_profile(obj));
+              }
+            } else if (!json["rbl_id"].isNull()) {
+              // Legacy single-stop layout.
+              profiles.push_back(read_profile(json.as<JsonVariantConst>()));
+            }
+            JsonVariantConst display = json["display"];
+            if (!display.isNull()) {
+              prefs.brightness_pct =
+                JsonToInt(display["brightness"], prefs.brightness_pct);
+              prefs.dim_after_s = JsonToInt(display["dim_after_s"], prefs.dim_after_s);
+              prefs.off_after_s = JsonToInt(display["off_after_s"], prefs.off_after_s);
+              prefs.Clamp();
+            }
+            LogInfo(F("config-read-ok"),
+                    "profiles=" + String(static_cast<int>(profiles.size())));
+            return !profiles.empty();
           } else {
-#ifdef DEBUG_SERIAL_WIEN_MONITOR
-            Serial.println("failed to load json config");
-#endif
+            LogError(F("config-json-failed"), error.c_str());
           }
         }
         configFile.close();
+      } else {
+        LogWarn(F("config-missing"));
       }
     } else {
-#ifdef DEBUG_SERIAL_WIEN_MONITOR
-      Serial.println("failed to mount FS");
-#endif
+      LogError(F("spiffs-mount-failed"));
     }
     // end read
     return false;
   }
 
   /**
-     * @brief Deletes the configuration file from SPIFFS.
+     * @brief Deletes the configuration file (and the cached stop list) from
+     * SPIFFS.
      */
   static void DeleteConfigFile() {
     if (SPIFFS.begin()) {
       if (SPIFFS.exists(JSON_CONFIG_FILE)) {
         if (SPIFFS.remove(JSON_CONFIG_FILE)) {
-#ifdef DEBUG_SERIAL_WIEN_MONITOR
-          Serial.println("Config file successfully deleted");
-#endif
+          LogInfo(F("config-deleted"));
         } else {
-#ifdef DEBUG_SERIAL_WIEN_MONITOR
-          Serial.println("Failed to delete config file");
-#endif
+          LogError(F("config-delete-failed"));
         }
       } else {
-#ifdef DEBUG_SERIAL_WIEN_MONITOR
-        Serial.println("Config file does not exist");
-#endif
+        LogWarn(F("config-delete-skipped"), String(F("file missing")));
       }
+      SPIFFS.remove(STOPS_INDEX_FILE);
+      SPIFFS.remove(LINES_INDEX_FILE);
       SPIFFS.end();
     } else {
-#ifdef DEBUG_SERIAL_WIEN_MONITOR
-      Serial.println("Failed to initialize SPIFFS");
-#endif
+      LogError(F("spiffs-mount-failed"));
     }
   }
 };
@@ -503,7 +708,8 @@ struct GlobalSettings {
   ///< Number of milliseconds to delay before resetting the device if an error.
   static constexpr int ms_error_resset_delay = 10 * 1000;
 
-  ///< Number of milliseconds to reset esp.
+  ///< Maintenance reboot interval. It only happens while the display is off,
+  ///< and the device comes back with the display still off.
   static constexpr int ms_reboot_interval = 3 * 60 * 60 * 1000;
 
   ///< Number of milliseconds to delay between checking the reset button state.
@@ -512,48 +718,212 @@ struct GlobalSettings {
   ///< Number of milliseconds to delay between updating the data.
   static constexpr int ms_task_delay_data_update = 20 * 1000;
 
-  ///< Number of milliseconds to delay between updating the screen.
+  ///< Frame delay while text is scrolling.
   static constexpr int ms_task_delay_screen_update = 10;
+
+  ///< Frame delay while nothing on screen moves. Frames are skipped entirely
+  ///< when nothing changed, so this only bounds how quickly changes show up.
+  static constexpr int ms_task_delay_screen_idle = 50;
+
+  ///< Hold a finger on the display this long to open the setup screen.
+  static constexpr int ms_long_press = 1200;
+
+  ///< CPU clock while awake. 160 MHz keeps TLS and drawing quick while using
+  ///< noticeably less power than 240 MHz.
+  static constexpr int mhz_cpu_awake = 160;
+
+  ///< CPU clock while the display sleeps. The WiFi radio is powered down in
+  ///< that state, so we can safely drop below the 80 MHz WiFi floor. Most of
+  ///< that time is spent in light sleep anyway.
+  static constexpr int mhz_cpu_asleep = 40;
 
   ///< real count down can be faster thet real ms_task_delay_data_update
   ///< this offset time help meke more smoth transition
   static constexpr int ms_additional_time_for_countdown = 50;
 
-  ///< Size of font that show in first second plug in
-  static constexpr int size_start_instruction_font = 4;
-
   ///< how much pixels scroll per frame
   static constexpr int px_scrool_per_frame = 2;
 
+  ///< Height of the compact stop/time header bar at the top of the display.
+  static constexpr int px_header_height = 22;
+
 private:
-  ///< The configuration object.
-  Config config;
+  ///< The saved stop profiles (always kProfileCount entries; unused slots have
+  ///< an empty RBL).
+  std::vector<Config> profiles;
+
+  ///< Display/battery preferences.
+  DisplayPrefs prefs;
+
+  ///< Index of the profile currently shown on screen.
+  volatile int active_profile = 0;
+
+  ///< Cached number of configured profiles, readable from any task without
+  ///< touching the profile vector.
+  volatile int configured_count = 0;
 
   ///< Whether or not the configuration file has been loaded.
   bool is_config_loaded = false;
 
-public:
   /**
-     * @brief Gets the global settings.
-     *
-     * @return A reference to the global settings object.
+     * @brief Loads profiles from flash once and pads the list to kProfileCount.
      */
-  const Config& GetConfig() {
-    if (!is_config_loaded) {
-      is_config_loaded = ConfigFileHandler::LoadConfigFile(config);
+  void EnsureLoaded() {
+    if (is_config_loaded) {
+      return;
     }
-    return config;
+    ConfigFileHandler::LoadConfigFile(profiles, prefs);
+    PadProfiles();
+    // Start on the first profile that actually points at a stop.
+    active_profile = FirstConfiguredIndex();
+    is_config_loaded = true;
+  }
+
+  void PadProfiles() {
+    while (static_cast<int>(profiles.size()) < kProfileCount) {
+      profiles.push_back(Config());
+    }
+    if (profiles.size() > kProfileCount) {
+      profiles.resize(kProfileCount);
+    }
+    int count = 0;
+    for (const auto& cfg : profiles) {
+      if (cfg.IsConfigured()) {
+        ++count;
+      }
+    }
+    configured_count = count;
   }
 
   /**
-     * @brief Sets the global settings.
-     *
-     * @param new_config The new global settings.
+     * @brief Index of the first configured profile, or 0 if none are set.
      */
-  void SetConfig(const Config& new_config) {
-    config = new_config;
-    ConfigFileHandler::SaveConfigFile(config);
-    is_config_loaded = true;
+  int FirstConfiguredIndex() {
+    for (int i = 0; i < static_cast<int>(profiles.size()); ++i) {
+      if (profiles[i].IsConfigured()) {
+        return i;
+      }
+    }
+    return 0;
+  }
+
+public:
+  /**
+     * @brief Gets the configuration of the currently active stop profile.
+     *
+     * @return A reference to the active profile's configuration.
+     */
+  const Config& GetConfig() {
+    EnsureLoaded();
+    return profiles[active_profile];
+  }
+
+  /**
+     * @brief Gets all saved stop profiles.
+     *
+     * @return A reference to the list of profiles.
+     */
+  const std::vector<Config>& GetProfiles() {
+    EnsureLoaded();
+    return profiles;
+  }
+
+  /**
+     * @brief How many slots hold a configured stop. Safe to call from any task.
+     *
+     * @return The number of configured profiles.
+     */
+  int GetConfiguredCount() {
+    EnsureLoaded();
+    return configured_count;
+  }
+
+  /**
+     * @brief Gets the active profile's 0-based index.
+     */
+  int GetActiveIndex() {
+    EnsureLoaded();
+    return active_profile;
+  }
+
+  /**
+     * @brief Makes the given slot the active one, if it holds a stop.
+     *
+     * @return True if the active profile changed.
+     */
+  bool SetActiveIndex(int index) {
+    EnsureLoaded();
+    if (index < 0 || index >= static_cast<int>(profiles.size())
+        || !profiles[index].IsConfigured() || index == active_profile) {
+      return false;
+    }
+    active_profile = index;
+    return true;
+  }
+
+  /**
+     * @brief Advances the active profile to the next configured stop.
+     *
+     * @param direction +1 for the next stop, -1 for the previous one.
+     * @return True if the active profile actually changed.
+     */
+  bool CycleProfile(int direction) {
+    EnsureLoaded();
+    if (GetConfiguredCount() <= 1) {
+      return false;
+    }
+    int idx = active_profile;
+    const int n = static_cast<int>(profiles.size());
+    for (int step = 0; step < n; ++step) {
+      idx = (idx + direction + n) % n;
+      if (profiles[idx].IsConfigured()) {
+        active_profile = idx;
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+     * @brief Replaces all stop profiles and persists them to flash.
+     *
+     * @param new_profiles The new list of profiles.
+     * @param preferred_active Slot to show afterwards; falls back to the first
+     * configured stop when it is out of range or empty.
+     */
+  void SetProfiles(const std::vector<Config>& new_profiles,
+                   int preferred_active = -1) {
+    EnsureLoaded();
+    profiles = new_profiles;
+    PadProfiles();
+    ConfigFileHandler::SaveConfigFile(profiles, prefs);
+    if (preferred_active >= 0 && preferred_active < kProfileCount
+        && profiles[preferred_active].IsConfigured()) {
+      active_profile = preferred_active;
+    } else {
+      active_profile = FirstConfiguredIndex();
+    }
+  }
+
+  /**
+     * @brief Display/battery preferences (copied, so safe to read anywhere).
+     */
+  DisplayPrefs GetPrefs() {
+    EnsureLoaded();
+    return prefs;
+  }
+
+  /**
+     * @brief Updates and persists the display/battery preferences.
+     */
+  void SetPrefs(DisplayPrefs new_prefs) {
+    EnsureLoaded();
+    new_prefs.Clamp();
+    if (new_prefs == prefs) {
+      return;
+    }
+    prefs = new_prefs;
+    ConfigFileHandler::SaveConfigFile(profiles, prefs);
   }
 
   /**
@@ -563,6 +933,65 @@ public:
     ConfigFileHandler::DeleteConfigFile();
   }
 } global_settings;
+
+void LogLine(const char* level, const __FlashStringHelper* event,
+             const String& detail = "") {
+#if ENABLE_SERIAL_LOGS
+  Serial.print("[");
+  Serial.print(millis());
+  Serial.print(" ms] ");
+  Serial.print(level);
+  Serial.print(" ");
+  Serial.print(event);
+  if (detail.length()) {
+    Serial.print(" | ");
+    Serial.print(detail);
+  }
+  Serial.print(" | heap=");
+  Serial.println(ESP.getFreeHeap());
+#endif
+}
+
+void LogInfo(const __FlashStringHelper* event, const String& detail) {
+  LogLine("INFO", event, detail);
+}
+
+void LogWarn(const __FlashStringHelper* event, const String& detail) {
+  LogLine("WARN", event, detail);
+}
+
+void LogError(const __FlashStringHelper* event, const String& detail) {
+  LogLine("ERROR", event, detail);
+}
+
+void LogProfile(const Config& cfg, int index) {
+#if ENABLE_SERIAL_LOGS
+  String detail = "slot=" + String(index + 1);
+  detail += " name='" + cfg.GetName() + "'";
+  detail += " rbl=" + cfg.GetLinesRblAsString();
+  detail += " rows=" + cfg.GetLinesCountAsString();
+  detail += " filter='" + cfg.GetLinesFilterAsString() + "'";
+  LogInfo(F("profile"), detail);
+#endif
+}
+
+bool CreateTaskChecked(TaskFunction_t task,
+                       const char* name,
+                       uint32_t stack_bytes,
+                       UBaseType_t priority) {
+  BaseType_t result =
+    xTaskCreate(task, name, stack_bytes, NULL, priority, NULL);
+
+  String detail = String(name) + " stack=" + String(stack_bytes)
+                  + " priority=" + String(priority);
+  if (result == pdPASS) {
+    LogInfo(F("task-created"), detail);
+    return true;
+  }
+
+  LogError(F("task-create-failed"), detail + " result=" + String(result));
+  return false;
+}
 
 class SmartWatch {
 public:
@@ -574,7 +1003,7 @@ public:
     return end_millis - start_millis;
   }
   ~SmartWatch() {
-#if 1
+#ifdef DEBUG_SERIAL_WIEN_MONITOR
     Serial.print("Function '");
     Serial.print(function_name);
     Serial.print("' executed in ");
@@ -595,11 +1024,77 @@ struct Monitor {
   std::vector<int> countdown;
 };
 
+struct CachedTraffic {
+  bool valid = false;
+  unsigned long fetched_ms = 0;
+  std::vector<Monitor> monitors;
+};
+
+static constexpr unsigned long kTrafficCacheMaxAgeMs = 10UL * 60UL * 1000UL;
+std::vector<CachedTraffic> g_traffic_cache(kProfileCount);
+
 struct ScreenEntity {
   String right_txt;  // Line name 2, 72, D etc.
   std::vector<String> lines;
   String left_txt;
 };
+
+bool IsValidProfileIndex(int profile_index) {
+  return profile_index >= 0 && profile_index < kProfileCount;
+}
+
+bool GetCachedTraffic(int profile_index, std::vector<Monitor>& out) {
+  if (!IsValidProfileIndex(profile_index)) {
+    return false;
+  }
+
+  const CachedTraffic& cache = g_traffic_cache[profile_index];
+  if (!cache.valid || cache.monitors.empty()) {
+    return false;
+  }
+
+  unsigned long age_ms = millis() - cache.fetched_ms;
+  if (age_ms > kTrafficCacheMaxAgeMs) {
+    LogWarn(F("cache-stale"), "slot=" + String(profile_index + 1));
+    return false;
+  }
+
+  int age_minutes = static_cast<int>(age_ms / 60000UL);
+  out = cache.monitors;
+  if (age_minutes > 0) {
+    for (auto& monitor : out) {
+      for (auto& countdown : monitor.countdown) {
+        countdown = std::max(0, countdown - age_minutes);
+      }
+    }
+  }
+
+  LogInfo(F("cache-hit"), "slot=" + String(profile_index + 1)
+                            + " ageMin=" + String(age_minutes)
+                            + " rows=" + String(out.size()));
+  return true;
+}
+
+void SaveTrafficCache(int profile_index, const std::vector<Monitor>& monitors) {
+  if (!IsValidProfileIndex(profile_index) || monitors.empty()) {
+    return;
+  }
+
+  CachedTraffic& cache = g_traffic_cache[profile_index];
+  cache.valid = true;
+  cache.fetched_ms = millis();
+  cache.monitors = monitors;
+  LogInfo(F("cache-save"), "slot=" + String(profile_index + 1)
+                            + " rows=" + String(monitors.size()));
+}
+
+void ClearTrafficCache() {
+  for (auto& cache : g_traffic_cache) {
+    cache.valid = false;
+    cache.monitors.clear();
+  }
+  LogInfo(F("cache-clear"));
+}
 
 
 /**
@@ -726,6 +1221,40 @@ public:
     return px_min_text_sprite;
   }
 
+  /**
+     * @brief Forces the next frame to be drawn even if nothing changed.
+     */
+  void Invalidate() {
+    dirty_ = true;
+  }
+
+  /**
+     * @brief Decides whether a frame with this content needs drawing.
+     *
+     * Drawing is skipped when the content is identical to the last frame and
+     * nothing is scrolling, which keeps the CPU and SPI bus idle most of the
+     * time.
+     *
+     * @param key A fingerprint of everything the frame shows.
+     * @return True if the caller should draw the frame.
+     */
+  bool BeginFrame(const String& key) {
+    if (!dirty_ && !animating_ && key == last_frame_key_) {
+      return false;
+    }
+    last_frame_key_ = key;
+    dirty_ = false;
+    animating_ = false;  // set again by DrawMiddleText while text scrolls
+    return true;
+  }
+
+  /**
+     * @brief Whether the last drawn frame had moving (scrolling) text.
+     */
+  bool IsAnimating() const {
+    return animating_;
+  }
+
 private:
   /**
      * @brief Converts a vector of German strings to Latin alphabet.
@@ -751,6 +1280,18 @@ private:
 
 
 private:
+  int ContentTop_px() const {
+    return global_settings.px_header_height;
+  }
+
+  int ContentHeight_px() const {
+    return std::max(1, tft.height() - ContentTop_px());
+  }
+
+  int RowHeight_px() const {
+    return std::max(1, ContentHeight_px() / cnt_rows);
+  }
+
   /**
      * @brief Draws the countdown text on the screen for a specific idx_row.
      *
@@ -816,11 +1357,12 @@ private:
 
     int cnt_lines_actual = static_cast<int>(vec_text_lines.size());
     for (int i = 0; i < std::min(cnt_lines_in_row, cnt_lines_actual); ++i) {
-      int px_height_full = static_cast<double>(tft.height() / cnt_rows);
+      int px_height_full = RowHeight_px();
       int dy = CalculateLineDistance_px(px_height_full, px_margin_lines,
                                         px_height_font, cnt_lines_in_row, i);
       int px_full_string =
         CalculateFontWidth_px(p_font, vec_text_lines[i].c_str());
+      const int px_scroll_before = vec_scroll_cord[i];
 
       // Reset to the right edge of the screen
       if (vec_scroll_cord[i] < (px_full_string * -1)) {
@@ -842,6 +1384,10 @@ private:
         is_init_cords[i] = false;
       }
 
+      if (vec_scroll_cord[i] != px_scroll_before) {
+        animating_ = true;
+      }
+
       // Draw text on the sprite
       sprite.setTextColor(TFT_TEXT);
       sprite.fillSprite(TFT_BG);
@@ -850,7 +1396,7 @@ private:
 
       // Push sprite to display
       int x_cord = px_margin + px_margin + px_width_stopcode;
-      int y_cord = dy + ((tft.height() / cnt_rows) * idx_row);
+      int y_cord = ContentTop_px() + dy + (RowHeight_px() * idx_row);
       sprite.pushSprite(x_cord, y_cord);
     }
     sprite.deleteSprite();
@@ -871,7 +1417,7 @@ private:
                         const GFXfont* p_font, int px_max_width) const {
     const int px_width_sprite = CalculateFontWidth_px(p_font, text);
     const int px_height_font = CalculatefontHeight_px(p_font);
-    const int px_height_full = tft.height() / cnt_rows;
+    const int px_height_full = RowHeight_px();
     const int dy =
       CalculateLineDistance_px(px_height_full, 0, px_height_font, 1, 0);
 
@@ -923,20 +1469,27 @@ private:
     }
     // if (px_width_sprite < px_max_width) {
     //  Create and display left background sprite
-    bg_left_sprite.createSprite(px_max_width - px_width_sprite, px_height_font);
-    bg_left_sprite.fillSprite(color_left);
-    int bg_left_x_cord = x - (px_max_width - px_width_sprite);
-    int bg_left_y_cord = y + dy + (px_height_full * idx_row);
-    bg_left_sprite.pushSprite(bg_left_x_cord, bg_left_y_cord);
-    bg_left_sprite.deleteSprite();
+    const int bg_width = std::max(0, px_max_width - px_width_sprite);
+    if (bg_width > 0) {
+      bg_left_sprite.createSprite(bg_width, px_height_font);
+      bg_left_sprite.fillSprite(color_left);
+      int bg_left_x_cord = x - bg_width;
+      int bg_left_y_cord =
+        ContentTop_px() + y + dy + (px_height_full * idx_row);
+      bg_left_sprite.pushSprite(bg_left_x_cord, bg_left_y_cord);
+      bg_left_sprite.deleteSprite();
+    }
 
     // Create and display right background sprite
     const int bg_right_x = x + px_width_sprite;
-    const int bg_right_width = px_max_width - px_width_sprite;
-    bg_right_sprite.createSprite(bg_right_width, px_height_font);
-    bg_right_sprite.fillSprite(color_right);
-    bg_right_sprite.pushSprite(bg_right_x, y + dy + (px_height_full * idx_row));
-    bg_right_sprite.deleteSprite();
+    const int bg_right_width = bg_width;
+    if (bg_right_width > 0) {
+      bg_right_sprite.createSprite(bg_right_width, px_height_font);
+      bg_right_sprite.fillSprite(color_right);
+      bg_right_sprite.pushSprite(
+        bg_right_x, ContentTop_px() + y + dy + (px_height_full * idx_row));
+      bg_right_sprite.deleteSprite();
+    }
     //}
 
     // Create and display text sprite
@@ -945,7 +1498,7 @@ private:
             sprite.setTextColor(TFT_TEXT);
             sprite.setFreeFont(p_font);
             sprite.drawString(text, 0, 0);*/
-    sprite.pushSprite(x, y + dy + (px_height_full * idx_row));
+    sprite.pushSprite(x, ContentTop_px() + y + dy + (px_height_full * idx_row));
     sprite.deleteSprite();
   }
 
@@ -960,8 +1513,9 @@ private:
     lines_separator.createSprite(tft.width(), px_separate_line_height);
 
     for (int i = 1; i < cnt_rows; ++i) {
-      int px_height_and_sprite = (tft.height() - (px_separate_line_height * i));
-      int y_cord = px_height_and_sprite / cnt_rows * i;
+      int px_height_and_sprite =
+        (ContentHeight_px() - (px_separate_line_height * i));
+      int y_cord = ContentTop_px() + ((px_height_and_sprite / cnt_rows) * i);
       // Clear the sprite and draw a horizontal line
       lines_separator.fillSprite(TFT_BLACK);
       lines_separator.drawFastHLine(0, 0, tft.width(), TFT_BLACK);
@@ -983,7 +1537,7 @@ private:
   void SetMaxNameTextWidth_px(int px_w) {
     if (px_w > px_max_width_name_text) {
       px_max_width_name_text = px_w;
-      tft.fillScreen(TFT_BG);
+      ClearContentForRelayout();
     }
   }
 
@@ -997,10 +1551,19 @@ private:
   void SetMaxCountdownTextWidth_px(int px_w) {
     if (px_w > px_max_width_countdown_text) {
       px_max_width_countdown_text = px_w;
-      tft.fillScreen(TFT_BG);
+      ClearContentForRelayout();
     }
   }
 
+
+  /**
+     * @brief Clears the row area after the column widths grew. Rows already
+     * drawn this frame are wiped too, so the next frame must redraw.
+     */
+  void ClearContentForRelayout() {
+    tft.fillRect(0, ContentTop_px(), tft.width(), ContentHeight_px(), TFT_BG);
+    dirty_ = true;
+  }
 
   /**
      * @brief Gets the maximum px_width of the countdown text in pixels.
@@ -1171,8 +1734,14 @@ private:
   int px_min_text_sprite;
   mutable std::map<const GFXfont*, int> font_height_cache;
 
+  ///< Frame skipping state (see BeginFrame).
+  bool dirty_ = true;
+  bool animating_ = false;
+  String last_frame_key_;
+
 public:
   void FullResetScroll() {
+    dirty_ = true;
     for (size_t i = 0; i < vec_scrolls_coords.size(); ++i) {
       for (size_t j = 0; j < vec_scrolls_coords[i].size(); ++j) {
         vec_scrolls_coords[i][j] = 0;
@@ -1188,6 +1757,7 @@ public:
 
 
   void SelectiveResetScroll(const std::vector<bool>& isNeedReset) {
+    dirty_ = true;
     // printf("\n\n%d %d\n\n ", vec_init_scrolls_coords.size(),
     // isNeedReset.size());
     for (size_t i = 0; i < vec_scrolls_coords.size(); ++i) {
@@ -1209,6 +1779,115 @@ public:
     // printf("\n\n");
   }
 };
+
+void ConfigureClock() {
+  const char* vienna_tz = "CET-1CEST,M3.5.0,M10.5.0/3";
+  configTzTime(vienna_tz, "pool.ntp.org", "time.nist.gov");
+  setenv("TZ", vienna_tz, 1);
+  tzset();
+
+  for (int i = 0; i < 10; ++i) {
+    if (time(nullptr) > 1600000000) {
+      LogInfo(F("clock-synced"), GetClockText());
+      return;
+    }
+    delay(200);
+  }
+  LogWarn(F("clock-not-synced"));
+}
+
+String GetClockText() {
+  time_t now = time(nullptr);
+  if (now <= 1600000000) {
+    return "--:--";
+  }
+
+  struct tm timeinfo;
+  localtime_r(&now, &timeinfo);
+
+  char buffer[6];
+  strftime(buffer, sizeof(buffer), "%H:%M", &timeinfo);
+  return String(buffer);
+}
+
+void DrawHeaderBar() {
+  const int h = global_settings.px_header_height;
+  const int pad_x = 6;
+  const uint16_t bg = tft.color565(8, 18, 18);
+  const uint16_t fg = tft.color565(210, 238, 223);
+  const uint16_t accent = tft.color565(64, 158, 141);
+
+  const Config& cfg = global_settings.GetConfig();
+  String stop_name;
+  if (cfg.GetName().length()) {
+    stop_name = Screen::ConvertGermanToLatin(cfg.GetName());
+  } else {
+    stop_name = String("Stop ") + String(global_settings.GetActiveIndex() + 1);
+  }
+  String clock = GetClockText();
+  String header_key = stop_name + "|" + clock;
+
+  // Only redraw when the text changes (the clock ticks once a minute).
+  static String last_header_key;
+  if (!g_force_header_redraw && header_key == last_header_key) {
+    return;
+  }
+  g_force_header_redraw = false;
+  last_header_key = header_key;
+
+  TFT_eSprite header(&tft);
+  header.createSprite(tft.width(), h);
+  header.fillSprite(bg);
+  header.drawFastHLine(0, h - 1, tft.width(), accent);
+  header.setTextFont(2);
+  header.setTextColor(fg, bg);
+
+  int clock_width = header.textWidth(clock);
+  int max_name_width = tft.width() - clock_width - (pad_x * 3);
+  while (stop_name.length() > 1 && header.textWidth(stop_name) > max_name_width) {
+    stop_name.remove(stop_name.length() - 1);
+  }
+
+  header.setTextDatum(ML_DATUM);
+  header.drawString(stop_name, pad_x, h / 2);
+  header.setTextDatum(MR_DATUM);
+  header.drawString(clock, tft.width() - pad_x, h / 2);
+  header.pushSprite(0, 0);
+  header.deleteSprite();
+}
+
+String GetActiveStopDisplayName() {
+  const Config& cfg = global_settings.GetConfig();
+  if (cfg.GetName().length()) {
+    return Screen::ConvertGermanToLatin(cfg.GetName());
+  }
+  return String("Stop ") + String(global_settings.GetActiveIndex() + 1);
+}
+
+void ShowStatusScreen(const String& title, const String& subtitle) {
+  g_status_screen_visible = true;
+  g_force_header_redraw = true;
+  tft.fillScreen(TFT_BG);
+  tft.setTextColor(TFT_TEXT, TFT_BG);
+  tft.setTextDatum(MC_DATUM);
+  tft.setFreeFont(&FreeSansBold12pt7b);
+  tft.drawString(title, tft.width() / 2, (tft.height() / 2) - 18);
+
+  if (subtitle.length()) {
+    tft.setTextFont(2);
+    tft.drawString(subtitle, tft.width() / 2, (tft.height() / 2) + 16);
+  }
+
+  tft.setTextDatum(TL_DATUM);
+  DrawHeaderBar();
+}
+
+void ShowFetchingStopScreen(const Config& cfg) {
+  String title = cfg.GetName().length()
+                   ? Screen::ConvertGermanToLatin(cfg.GetName())
+                   : String("Stop ") + String(global_settings.GetActiveIndex() + 1);
+  ShowStatusScreen(title);
+}
 
 
 
@@ -1298,6 +1977,19 @@ public:
     //shift_cnt = 0;
     prev_iterations = 0;
     //SmartWatch sm(__FUNCTION__);
+    bool had_data = HasData();
+
+    if (vec.empty()) {
+      all_trafic_set.clear();
+      shift_cnt = 0;
+      coundown_idx = 0;
+      delete p_trafic_clock;
+      p_trafic_clock = nullptr;
+      if (p_screen) {
+        p_screen->FullResetScroll();
+      }
+      return;
+    }
 
     if (p_trafic_clock) {
       p_trafic_clock->Reset();
@@ -1319,6 +2011,27 @@ public:
       SelectiveReset(currentTraficSubset, futureTraficSubset);
     }
     all_trafic_set = vec;
+    if (!had_data || g_status_screen_visible) {
+      ClearContentArea();
+    }
+  }
+
+
+  /**
+   * @brief Updates the screen with traffic information.
+   */
+  bool HasData() const {
+    return !all_trafic_set.empty();
+  }
+
+
+  void ClearContentArea() const {
+    tft.fillRect(0, global_settings.px_header_height, tft.width(),
+                 tft.height() - global_settings.px_header_height, TFT_BG);
+    g_status_screen_visible = false;
+    if (p_screen) {
+      p_screen->FullResetScroll();
+    }
   }
 
 
@@ -1463,7 +2176,6 @@ public:
       std::vector<String> clean_str;
       for (size_t x = 0; x < global_settings.cnt_screen_lines_per_rows; ++x) {
         clean_str.push_back("");
-        clean_str.push_back("");
       }
       //std::vector<String>(global_settings.cnt_screen_lines_per_rows, "");
 
@@ -1477,17 +2189,21 @@ public:
         }
 
         const Monitor& currentMonitor = currentTrafficSubset[monior_idx];
-        if (i > currentMonitor.countdown.size() - 1
+        if (currentMonitor.countdown.empty()) {
+          continue;
+        }
+        if (i >= currentMonitor.countdown.size()
             && currentTrafficSubset.size() == 1) {
           // break if this cyclig getting
           break;
         }
         size_t idx = currentTrafficSubset.size() == 1 ? i : coundown_idx;
         if (currentTrafficSubset.size() == 1
-            && idx > currentMonitor.countdown.size()) {
+            && idx >= currentMonitor.countdown.size()) {
           // break if this single line and countdown for this line cycle
           break;
         }
+        idx = std::min(idx, currentMonitor.countdown.size() - 1);
         // Set the right text
         monitor.right_txt = currentMonitor.name;
 
@@ -1543,6 +2259,22 @@ public:
 
       // Serial.println("roww setted;");
     }
+    // Skip the (expensive) redraw when the frame would look the same.
+    String frame_key;
+    for (const auto& entity : vec_screen_entity) {
+      frame_key += entity.right_txt;
+      frame_key += '';
+      frame_key += entity.left_txt;
+      for (const auto& line : entity.lines) {
+        frame_key += '';
+        frame_key += line;
+      }
+      frame_key += '';
+    }
+    if (!p_screen->BeginFrame(frame_key)) {
+      return;
+    }
+
     // render entity
     for (size_t i = 0; i < vec_screen_entity.size(); ++i) {
       p_screen->SetRow(vec_screen_entity[i], i);
@@ -1709,25 +2441,30 @@ void PrintDebugMonitor(const Monitor& t) {
 }
 
 
-String FixJsonMistake(String word) {
-  word = Screen::ConvertGermanToLatin(word);
-  // Check if the input string contains spaces
-#if DEBUG_SERIAL_WIEN_MONITOR
-  Serial.println(word);
-#endif
+/**
+ * @brief The API writes some destinations in capitals ("LEOPOLDAU"); turn a
+ * single such word into "Leopoldau". Multi-word names are left alone.
+ */
+String TitleCaseSingleWord(String word) {
   word.trim();
   if (word.indexOf('-') == -1
       && word.indexOf(' ') == -1
       && word.length() > 1) {
     for (int i = 0; i < word.length(); i++) {
-      word[i] = tolower(word[i]);  // Convert all letters to lowercase
+      word[i] = tolower(static_cast<unsigned char>(word[i]));
     }
-    word[0] = toupper(word[0]);  // Convert the first letter to uppercase
+    word[0] = toupper(static_cast<unsigned char>(word[0]));
   }
+  return word;
+}
+
+
+String FixJsonMistake(String word) {
+  word = Screen::ConvertGermanToLatin(word);
 #if DEBUG_SERIAL_WIEN_MONITOR
   Serial.println(word);
 #endif
-  return word;
+  return TitleCaseSingleWord(word);
 }
 
 
@@ -1738,118 +2475,91 @@ void PrintDegbugMonitors(const std::vector<Monitor>& monitors) {
 }
 
 
-std::vector<Monitor> GetMonitorsFromJson(const String& json) {
-  //SmartWatch sm(__FUNCTION__);
+// Only the fields the display needs are kept while parsing, which keeps the
+// JSON document small no matter how busy the stop is.
+static const char kMonitorFilterJson[] =
+  "{\"data\":{"
+  "\"monitors\":[{\"lines\":[{\"name\":true,\"towards\":true,"
+  "\"departures\":{\"departure\":[{\"departureTime\":{\"countdown\":true},"
+  "\"vehicle\":{\"name\":true,\"towards\":true}}]}}]}],"
+  "\"trafficInfos\":[{\"description\":true,\"relatedLines\":true}]}}";
+
+
+std::vector<Monitor> GetMonitorsFromJson(JsonDocument& root) {
   std::vector<Monitor> monitors_vec;
 
-  DynamicJsonDocument root(2048 * 8);
-  DeserializationError error =
-    deserializeJson(root, json, DeserializationOption::NestingLimit(64));
-
-  if (error) {
-#ifdef DEBUG_SERIAL_WIEN_MONITOR
-    Serial.println("Failed to parse JSON response.");
-    Serial.println(error.c_str());
-#endif
-    // screenInit();  // draw empty screen
-    delay(global_settings.ms_error_resset_delay);
-
+  JsonObject data = root["data"];
+  if (data.isNull()) {
+    g_last_data_error = "json-missing-data";
+    LogWarn(F("json-missing-data"));
     return monitors_vec;
   }
 
-  const JsonObject data = root["data"];
-  const JsonArray traffic_infos = data["trafficInfos"];
   std::map<String, String> lines_to_description_map;
-  for (const auto& traffic_info : traffic_infos) {
-    if (traffic_info.containsKey("description")) {
-      const String description = Screen::ConvertGermanToLatin(
-        traffic_info["description"].as<String>());
-      const JsonArray related_lines = traffic_info["relatedLines"];
-
-      for (const auto& related_line : related_lines) {
-        String name_transport_with_descr = related_line.as<String>();
-
-        lines_to_description_map[name_transport_with_descr] = description;
-        Serial.print("descr");
-        Serial.print(name_transport_with_descr);
-        Serial.println(description);
-      }
+  for (JsonVariant traffic_info : data["trafficInfos"].as<JsonArray>()) {
+    if (!traffic_info["description"].is<const char*>()) {
+      continue;
+    }
+    const String description = Screen::ConvertGermanToLatin(
+      traffic_info["description"].as<String>());
+    for (JsonVariant related_line : traffic_info["relatedLines"].as<JsonArray>()) {
+      lines_to_description_map[related_line.as<String>()] = description;
     }
   }
 
-  const JsonArray monitors = data["monitors"];
-  for (const auto& monitor : monitors) {
-    const JsonArray lines = monitor["lines"];
-    for (const auto& line : lines) {
-      const JsonObject departures = line["departures"];
-      Monitor cur_monitor;
+  auto add_departure = [&](JsonObject line, JsonVariant departureItem) {
+    JsonVariant departureTime = departureItem["departureTime"];
+    if (!departureTime["countdown"].is<int>()) {
+      return;
+    }
 
-      const JsonVariant departure = departures["departure"];
+    Monitor cur_monitor;
+    JsonVariant vehicle = departureItem["vehicle"];
+    if (vehicle.is<JsonObject>()) {
+      cur_monitor.name = vehicle["name"].as<String>();
+      cur_monitor.towards = FixJsonMistake(vehicle["towards"].as<String>());
+    } else {
+      cur_monitor.name = line["name"].as<String>();
+      cur_monitor.towards = FixJsonMistake(line["towards"].as<String>());
+    }
+
+    int countdown = departureTime["countdown"].as<int>();
+    if (cur_monitor.name.isEmpty() || countdown < 0) {
+      return;
+    }
+
+    cur_monitor.countdown.push_back(countdown);
+    cur_monitor.description = lines_to_description_map[cur_monitor.name];
+
+    auto it = std::find_if(monitors_vec.begin(), monitors_vec.end(),
+                           [&cur_monitor](const Monitor& monitor) {
+                             return monitor.name == cur_monitor.name
+                                    && monitor.towards == cur_monitor.towards;
+                           });
+
+    if (it == monitors_vec.end()) {
+      monitors_vec.push_back(cur_monitor);
+    } else {
+      it->countdown.push_back(countdown);
+    }
+  };
+
+  for (JsonVariant monitor : data["monitors"].as<JsonArray>()) {
+    for (JsonVariant lineVariant : monitor["lines"].as<JsonArray>()) {
+      JsonObject line = lineVariant.as<JsonObject>();
+      JsonVariant departure = line["departures"]["departure"];
 
       if (departure.is<JsonArray>()) {
-        const JsonArray& departuresArray = departure.as<JsonArray>();
-        // cur_monitor.countdown.reserve(departuresArray.size());
-
-        for (const auto& departureItem : departuresArray) {
-          Monitor cur_monitor;
-
-          int countdown = -1;
-          if (departureItem.containsKey("vehicle")
-              && departureItem.containsKey("departureTime")) {
-            // Serial.println("_____2");
-
-            const JsonObject vehicle = departureItem["vehicle"];
-            cur_monitor.name = vehicle["name"].as<String>();
-            cur_monitor.towards =
-              FixJsonMistake(vehicle["towards"].as<String>());
-
-            const JsonObject departureTime = departureItem["departureTime"];
-            countdown = departureTime["countdown"].as<int>();
-            countdown = departureTime["countdown"].as<int>();
-            if (countdown != -1) {
-              cur_monitor.countdown.push_back(countdown);
-            }
-            //serializeJsonPretty(departureItem, Serial);
-
-          } else if (departureItem.containsKey("departureTime")) {
-            // Serial.println("_____1");
-            // teake information in upper lavel
-            cur_monitor.name = line["name"].as<String>();
-            cur_monitor.towards = FixJsonMistake(line["towards"].as<String>());
-
-            const JsonObject departureTime = departureItem["departureTime"];
-            countdown = departureTime["countdown"].as<int>();
-            if (countdown != -1) {
-              cur_monitor.countdown.push_back(countdown);
-            }
-
-            // serializeJsonPretty(departureItem, Serial);
-          }
-          //////////////////////////
-          // description
-          cur_monitor.description = lines_to_description_map[cur_monitor.name];
-          /////////////////////////
-          auto it =
-            std::find_if(monitors_vec.begin(), monitors_vec.end(),
-                         [&cur_monitor](const Monitor& monitor) {
-                           return monitor.name == cur_monitor.name
-                                  && monitor.towards == cur_monitor.towards;
-                         });
-
-          if (it == monitors_vec.end()) {
-            monitors_vec.push_back(
-              cur_monitor);  // If not found, add a new Monitor
-          } else {
-            // If found, update the existing Monitor with the countdown counter
-            if (countdown != -1) {
-              it->countdown.push_back(countdown);
-            }
-          }
+        for (JsonVariant departureItem : departure.as<JsonArray>()) {
+          add_departure(line, departureItem);
         }
+      } else if (departure.is<JsonObject>()) {
+        add_departure(line, departure);
       }
     }
   }
 
+  LogInfo(F("json-parsed"), "monitors=" + String(monitors_vec.size()));
   return monitors_vec;
 }
 
@@ -1880,16 +2590,20 @@ String GetRandomString(int maxLength) {
  * @return A vector of substrings resulting from the split operation.
  */
 std::vector<String> GetSplittedStrings(String data, char separator) {
-  int separatorIndex = 0;
   std::vector<String> result;
 
-  while (separatorIndex != -1) {
-    separatorIndex = data.indexOf(separator);
-    String chunk = data.substring(0, separatorIndex);
-    result.push_back(chunk);
-    if (separatorIndex != -1) {
-      data = data.substring(separatorIndex + 1);
+  while (data.length()) {
+    int separatorIndex = data.indexOf(separator);
+    String chunk =
+      separatorIndex == -1 ? data : data.substring(0, separatorIndex);
+    chunk.trim();
+    if (chunk.length()) {
+      result.push_back(chunk);
     }
+    if (separatorIndex == -1) {
+      break;
+    }
+    data = data.substring(separatorIndex + 1);
   }
 
   return result;
@@ -1938,12 +2652,17 @@ std::vector<Monitor> GetFilteredMonitors(const std::vector<Monitor>& data,
     }
   }
 
+  if (result.empty()) {
+    LogWarn(F("filter-empty"),
+            "filter='" + filter + "' fetched=" + String(data.size()));
+  }
+
   return result;
 }
 
 
 void PrintDegbugMonitors(const Monitor& monitor) {
-#if 1
+#ifdef DEBUG_SERIAL_WIEN_MONITOR
   Serial.print("Name: ");
   Serial.print(monitor.name);
   // Serial.print(" Towards: ");
@@ -1961,198 +2680,1787 @@ void PrintDegbugMonitors(const Monitor& monitor) {
 }
 
 
+// ---------------------------------------------------------------------------
+// Power management.
+//
+// Awake:  PWM backlight at the chosen brightness, dimmed after a short idle
+//         period, CPU at 160 MHz, frames only redrawn when something changed.
+// Asleep: backlight off, ILI9341 in sleep mode, WiFi radio off and the chip in
+//         light sleep. The XPT2046 pulls its IRQ line low on touch, which wakes
+//         the chip; the BOOT button (reset gestures) wakes it too, and a slow
+//         timer is kept as a fallback for boards without a wired touch IRQ.
+// ---------------------------------------------------------------------------
+
+// MIPI DCS commands understood by the ILI9341 (and most other TFT drivers).
+static constexpr uint8_t kLcdSleepIn = 0x10;
+static constexpr uint8_t kLcdSleepOut = 0x11;
+static constexpr uint8_t kLcdDisplayOff = 0x28;
+static constexpr uint8_t kLcdDisplayOn = 0x29;
+
+static constexpr uint32_t kBacklightPwmHz = 5000;
+static constexpr uint8_t kBacklightPwmBits = 8;
+static constexpr uint8_t kBacklightPwmChannel = 0;  // ESP32 core 2.x only
+
+///< Fallback wake interval while asleep, for boards whose touch IRQ line is
+///< not wired. Each of these wakes lasts only a few tens of milliseconds.
+static constexpr uint64_t kLightSleepHeartbeatUs = 2ULL * 1000ULL * 1000ULL;
+
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+#define BACKLIGHT_PWM_TARGET TFT_BL
+#else
+#define BACKLIGHT_PWM_TARGET kBacklightPwmChannel
+#endif
+
+void BacklightBegin() {
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcAttach(TFT_BL, kBacklightPwmHz, kBacklightPwmBits);
+#else
+  ledcSetup(kBacklightPwmChannel, kBacklightPwmHz, kBacklightPwmBits);
+  ledcAttachPin(TFT_BL, kBacklightPwmChannel);
+#endif
+}
+
+void BacklightSetPct(int pct) {
+  const uint32_t max_duty = (1U << kBacklightPwmBits) - 1;
+  uint32_t duty = (static_cast<uint32_t>(constrain(pct, 0, 100)) * max_duty + 50) / 100;
+  if (TFT_BACKLIGHT_ON != HIGH) {
+    duty = max_duty - duty;
+  }
+  ledcWrite(BACKLIGHT_PWM_TARGET, duty);
+}
+
 /**
- * @brief Updates data for a specific task.
+ * @brief Switches the panel between normal operation and its sleep mode.
+ *
+ * The ILI9341 keeps its frame memory while asleep, so waking it shows the last
+ * frame again without a full redraw.
+ */
+void SetDisplayAwake(bool awake) {
+  const bool locked =
+    dataMutex && xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE;
+  const bool changed = g_display_awake != awake;
+  if (changed) {
+    if (awake) {
+      tft.writecommand(kLcdSleepOut);
+      vTaskDelay(pdMS_TO_TICKS(120));  // required settle time after sleep-out
+      tft.writecommand(kLcdDisplayOn);
+      g_force_header_redraw = true;
+      if (p_screen) {
+        p_screen->Invalidate();
+      }
+    } else {
+      BacklightSetPct(0);
+      tft.writecommand(kLcdDisplayOff);
+      tft.writecommand(kLcdSleepIn);
+    }
+    g_backlight_dimmed = false;
+    g_display_awake = awake;
+  }
+  if (locked) {
+    xSemaphoreGive(dataMutex);
+  }
+
+  if (!changed) {
+    return;
+  }
+  if (awake) {
+    // Give the screen task a moment to repaint before the light comes on, so
+    // the stale frame never flashes up.
+    vTaskDelay(pdMS_TO_TICKS(60));
+    BacklightSetPct(global_settings.GetPrefs().brightness_pct);
+    LogInfo(F("display-on"));
+  } else {
+    LogInfo(F("display-off"));
+  }
+}
+
+/**
+ * @brief Shows the cached departures (aged by the time spent asleep) right
+ * away when the display wakes, instead of the stale frame from before.
+ */
+void RefreshTrafficFromCacheForWake() {
+  if (!dataMutex || !pTraficManager
+      || xSemaphoreTake(dataMutex, portMAX_DELAY) != pdTRUE) {
+    return;
+  }
+  if (!g_setup_screen_visible && global_settings.GetConfiguredCount() > 0) {
+    std::vector<Monitor> cached;
+    if (GetCachedTraffic(global_settings.GetActiveIndex(), cached)) {
+      pTraficManager->update(cached);
+    } else {
+      pTraficManager->update(std::vector<Monitor>());
+      ShowFetchingStopScreen(global_settings.GetConfig());
+    }
+  }
+  xSemaphoreGive(dataMutex);
+}
+
+/**
+ * @brief Registers user activity. Wakes the display, or brings a dimmed
+ * backlight back to full brightness.
+ *
+ * @return True if the display was off or dimmed (the touch that caused this is
+ * then "used up" and should not also switch stops).
+ */
+bool WakeDisplayIfNeeded() {
+  g_last_touch_ms = millis();
+  if (g_display_awake) {
+    if (!g_backlight_dimmed) {
+      return false;
+    }
+    g_backlight_dimmed = false;
+    BacklightSetPct(global_settings.GetPrefs().brightness_pct);
+    LogInfo(F("display-undim"));
+    return true;
+  }
+
+  // Restore full CPU speed immediately so the wake feels instant. WiFi is
+  // brought back by UpdateDataTask; raising the clock is always safe.
+  setCpuFrequencyMhz(global_settings.mhz_cpu_awake);
+  RefreshTrafficFromCacheForWake();
+  SetDisplayAwake(true);
+  return true;
+}
+
+// Last access point we were connected to, so waking up can skip the WiFi scan.
+struct WifiLink {
+  bool valid = false;
+  String ssid;
+  String psk;
+  uint8_t bssid[6] = { 0 };
+  int32_t channel = 0;
+} g_wifi_link;
+
+void RememberWifiLink() {
+  if (WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+  g_wifi_link.ssid = WiFi.SSID();
+  g_wifi_link.psk = WiFi.psk();
+  const uint8_t* bssid = WiFi.BSSID();
+  if (bssid) {
+    memcpy(g_wifi_link.bssid, bssid, sizeof(g_wifi_link.bssid));
+  }
+  g_wifi_link.channel = WiFi.channel();
+  g_wifi_link.valid = g_wifi_link.ssid.length() > 0 && bssid != nullptr;
+}
+
+bool WaitForWifi(unsigned long timeout_ms) {
+  const unsigned long start_ms = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start_ms < timeout_ms) {
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+  return WiFi.status() == WL_CONNECTED;
+}
+
+void RestartMdns() {
+  MDNS.end();
+  if (MDNS.begin(DEVICE_HOSTNAME)) {
+    MDNS.addService("http", "tcp", 80);
+  } else {
+    LogWarn(F("mdns-failed"));
+  }
+}
+
+// These run from UpdateDataTask - the only task that uses WiFi in the
+// background - so the radio is never powered down from under an in-flight
+// fetch.
+void EnterDisplaySleepPowerSave() {
+  LogInfo(F("powersave-enter"));
+  MDNS.end();
+  // Drop the link and power the radio off (keep the saved credentials).
+  WiFi.disconnect(true, false);
+  WiFi.mode(WIFI_OFF);
+  // Radio is off, so we can safely fall below the WiFi-required 80 MHz.
+  setCpuFrequencyMhz(global_settings.mhz_cpu_asleep);
+}
+
+void ExitDisplaySleepPowerSave() {
+  // Back to full speed first so the reconnect and redraw are quick.
+  setCpuFrequencyMhz(global_settings.mhz_cpu_awake);
+  WiFi.mode(WIFI_STA);
+  LogInfo(F("powersave-exit"), String(F("reconnecting wifi")));
+
+  const char* psk = g_wifi_link.psk.length() ? g_wifi_link.psk.c_str() : nullptr;
+  bool connected = false;
+  if (g_wifi_link.valid) {
+    // Fast path: go straight to the last access point and channel.
+    WiFi.begin(g_wifi_link.ssid.c_str(), psk, g_wifi_link.channel,
+               g_wifi_link.bssid);
+    connected = WaitForWifi(4000);
+    if (!connected) {
+      LogWarn(F("wifi-fast-connect-failed"));
+      WiFi.disconnect();
+    }
+  }
+  if (!connected) {
+    if (g_wifi_link.valid) {
+      WiFi.begin(g_wifi_link.ssid.c_str(), psk);
+    } else {
+      // Credentials WiFiManager stored, so this never re-opens the portal.
+      WiFi.begin();
+    }
+    connected = WaitForWifi(10000);
+  }
+
+  if (connected) {
+    RememberWifiLink();
+    RestartMdns();
+    LogInfo(F("powersave-wifi-ok"), WiFi.localIP().toString());
+  } else {
+    LogWarn(F("powersave-wifi-timeout"));
+  }
+}
+
+/**
+ * @brief One light-sleep cycle while the display is off.
+ *
+ * Light sleep keeps RAM, tasks and timers intact, so everything simply resumes
+ * where it was. A pen-down on the touch panel wakes the display directly.
+ */
+void LightSleepOnce() {
+  const gpio_num_t touch_irq = static_cast<gpio_num_t>(XPT2046_IRQ);
+  const gpio_num_t boot_button =
+    static_cast<gpio_num_t>(global_settings.pin_reset_button);
+
+  // A finger already on the panel, or the BOOT button held (reset gesture):
+  // stay awake so TouchTask / ResetActionsTask can see it.
+  if (digitalRead(XPT2046_IRQ) == LOW
+      || digitalRead(global_settings.pin_reset_button) == LOW) {
+    vTaskDelay(pdMS_TO_TICKS(100));
+    return;
+  }
+
+  gpio_wakeup_enable(touch_irq, GPIO_INTR_LOW_LEVEL);
+  gpio_wakeup_enable(boot_button, GPIO_INTR_LOW_LEVEL);
+  esp_sleep_enable_gpio_wakeup();
+  esp_sleep_enable_timer_wakeup(kLightSleepHeartbeatUs);
+#if ENABLE_SERIAL_LOGS
+  Serial.flush();
+#endif
+  esp_light_sleep_start();
+  gpio_wakeup_disable(touch_irq);
+  gpio_wakeup_disable(boot_button);
+  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_GPIO);
+  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_TIMER);
+
+  // The IRQ line stays low while the pen is down; a few samples filter out
+  // glitches.
+  bool pen_down = false;
+  for (int i = 0; i < 5 && !pen_down; ++i) {
+    pen_down = digitalRead(XPT2046_IRQ) == LOW;
+    if (!pen_down) {
+      vTaskDelay(pdMS_TO_TICKS(2));
+    }
+  }
+  if (pen_down) {
+    g_ignore_touch_until_release = true;
+    WakeDisplayIfNeeded();
+  } else {
+    // Let TouchTask poll the panel once (fallback for boards without a wired
+    // touch IRQ) and ResetActionsTask look at the BOOT button.
+    vTaskDelay(pdMS_TO_TICKS(40));
+  }
+}
+
+/**
+ * @brief Parks the calling task (UpdateDataTask) in low-power mode until a
+ * touch wakes the display.
+ */
+void SleepUntilDisplayWakes() {
+  EnterDisplaySleepPowerSave();
+  while (!g_display_awake) {
+    LightSleepOnce();
+  }
+  ExitDisplaySleepPowerSave();
+}
+
+
+/**
+ * @brief Fetches departures for the active stop in the background.
+ *
+ * While the display is off this task is also the one that powers WiFi down and
+ * keeps the chip in light sleep (see SleepUntilDisplayWakes).
+ *
  * @param pvParameters Pointer to task-specific parameters.
  */
 void UpdateDataTask(void* pvParameters) {
-  std::vector<Monitor> allTrafficSetInit;
-  const int& delay_planned_ms = global_settings.ms_task_delay_data_update;
-  int delay_real_ms = 0;
+  LogInfo(F("data-task-start"));
+  const int delay_planned_ms = global_settings.ms_task_delay_data_update;
 
   while (true) {
-    {  //SmartWatch start
-      SmartWatch sm(__FUNCTION__);
-      // Fetch JSON data (may take several seconds)
-      const auto& cfg = global_settings.GetConfig();
+    if (g_config_portal_open) {
+      vTaskDelay(pdMS_TO_TICKS(500));
+      continue;
+    }
 
-      const String& rbl_id = GetJson(cfg.GetLinesRblAsString());
-      allTrafficSetInit = GetMonitorsFromJson(rbl_id);
-      const String& raw_filter = cfg.GetLinesFilterAsString();
-      allTrafficSetInit = GetFilteredMonitors(allTrafficSetInit, raw_filter);
+    // While the display sleeps there is nothing on screen to keep fresh, so
+    // park here in low-power mode. A touch wakes the display; we then restore
+    // power and fall straight through to refetch the latest departures.
+    if (!g_display_awake) {
+      SleepUntilDisplayWakes();
+      g_force_refresh = true;
+    }
 
-      // Acquire the data mutex
-      if (xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
-        /* //DEBUG
-            for (auto& c : allTrafficSetInit) {
-              static int k = 0;
-              if (k % 2 == 0) {
-                String random = GetRandomString(25);
-                if (random.length() > 15) {
-                  c.description = random;
-                }
-              }
-              k++;
-            }
-            */
-        if (!allTrafficSetInit.empty()) {
-          pTraficManager->update(allTrafficSetInit);
-#ifdef DEBUG_SERIAL_WIEN_MONITOR
-          Serial.println("Monitor data updated.");
-#endif
-        }
-        // Release the data mutex
-        xSemaphoreGive(dataMutex);
-      }
-      int execution_ms = static_cast<int>(sm.GetExecution_ms());
-      delay_real_ms = max(0, delay_planned_ms - execution_ms);
-    }  //SmartWatch end
-    vTaskDelay(pdMS_TO_TICKS(delay_real_ms));
-  }
-}
+    // The setup screen owns the display (first run, or opened by long press).
+    if (g_setup_screen_visible) {
+      vTaskDelay(pdMS_TO_TICKS(200));
+      continue;
+    }
 
+    // Clear the flag before fetching so a stop switch that happens *during*
+    // the fetch still forces another immediate refetch afterwards.
+    g_force_refresh = false;
+    const unsigned long cycle_start_ms = millis();
 
-/**
- * @brief Updates the screen for a specific task.
- * @param pvParameters Pointer to task-specific parameters.
- */
-void ScreenUpdateTask(void* pvParameters) {
-  const int delay_ms = global_settings.ms_task_delay_screen_update;
-
-  while (true) {
-    // Acquire the data mutex
+    int profile_index = 0;
+    uint32_t generation = 0;
+    Config cfg;
+    bool is_configured = true;
     if (xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
-      pTraficManager->updateScreen();
-      // Serial.println("Screen updated.");
+      profile_index = global_settings.GetActiveIndex();
+      cfg = global_settings.GetConfig();
+      generation = g_profile_generation;
+      is_configured = cfg.IsConfigured();
+      if (!is_configured) {
+        DrawSetupScreen();
+      } else if (!pTraficManager->HasData()) {
+        pTraficManager->update(std::vector<Monitor>());
+        ShowFetchingStopScreen(cfg);
+      }
+      xSemaphoreGive(dataMutex);
+    }
+    if (!is_configured) {
+      continue;
+    }
 
-      // Release the data mutex
+    LogInfo(F("data-cycle"), "rbl=" + cfg.GetLinesRblAsString()
+                               + " slot=" + String(profile_index + 1)
+                               + " filter='"
+                               + cfg.GetLinesFilterAsString() + "'");
+
+    std::vector<Monitor> fetchedTraffic;
+    const bool fetch_ok =
+      FetchDepartures(cfg.GetLinesRblAsString(), fetchedTraffic);
+    const String& raw_filter = cfg.GetLinesFilterAsString();
+    std::vector<Monitor> shownTraffic =
+      GetFilteredMonitors(fetchedTraffic, raw_filter);
+
+    if (xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
+      if (generation != g_profile_generation || g_setup_screen_visible) {
+        // The user switched stops (or opened setup) while we were fetching.
+        LogInfo(F("data-skip-stale"), "slot=" + String(profile_index + 1));
+        xSemaphoreGive(dataMutex);
+        continue;
+      }
+
+      if (!shownTraffic.empty()) {
+        SaveTrafficCache(profile_index, shownTraffic);
+      }
+
+      if (shownTraffic.empty() && pTraficManager->HasData()) {
+        // Keep showing what we have rather than blanking on a hiccup.
+        LogWarn(F("refresh-kept-cache"),
+                g_last_data_error.length() ? g_last_data_error
+                                           : String(F("empty refresh")));
+      } else {
+        pTraficManager->update(shownTraffic);
+        if (shownTraffic.empty()) {
+          if (g_last_data_error.startsWith("json-")) {
+            ShowStatusScreen("Data parse failed", g_last_data_error);
+          } else if (!fetch_ok) {
+            ShowStatusScreen(g_last_data_error == "wifi-disconnected"
+                               ? "No Wi-Fi connection"
+                               : "Fetch failed",
+                             g_last_data_error);
+          } else if (fetchedTraffic.empty()) {
+            ShowStatusScreen("No departures", "right now");
+          } else {
+            ShowStatusScreen("Filter matched nothing", raw_filter);
+          }
+        } else {
+          LogInfo(F("data-updated"),
+                  "shown=" + String(shownTraffic.size())
+                    + " fetched=" + String(fetchedTraffic.size()));
+        }
+      }
       xSemaphoreGive(dataMutex);
     }
 
-    vTaskDelay(pdMS_TO_TICKS(delay_ms));
+    // Sleep in short slices so a stop switch (touch) can break out early and
+    // refetch immediately instead of waiting out the full interval.
+    const int delay_real_ms =
+      std::max(0, delay_planned_ms - static_cast<int>(millis() - cycle_start_ms));
+    const int slice_ms = 100;
+    int waited_ms = 0;
+    while (waited_ms < delay_real_ms && !g_force_refresh && g_display_awake) {
+      vTaskDelay(pdMS_TO_TICKS(slice_ms));
+      waited_ms += slice_ms;
+    }
   }
 }
 
 
 /**
- * @brief Retrieves JSON data from a specified URL.
- * @param rbl_id The resource identifier to fetch data from.
- * @return The JSON data as a string or an empty string if unsuccessful.
+ * @brief Draws frames. Scrolling text gets a fast frame rate; otherwise frames
+ * are only drawn when something changed.
+ *
+ * @param pvParameters Pointer to task-specific parameters.
  */
-String GetJson(const String& rbl_id) {
-  //SmartWatch sm(__FUNCTION__);
+void ScreenUpdateTask(void* pvParameters) {
+  while (true) {
+    if (!g_display_awake || g_config_portal_open || g_setup_screen_visible) {
+      vTaskDelay(pdMS_TO_TICKS(50));
+      continue;
+    }
 
+    bool animating = false;
+    if (xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
+      pTraficManager->updateScreen();
+      DrawHeaderBar();
+      animating = p_screen && p_screen->IsAnimating();
+      xSemaphoreGive(dataMutex);
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(animating
+                                ? global_settings.ms_task_delay_screen_update
+                                : global_settings.ms_task_delay_screen_idle));
+  }
+}
+
+
+/**
+ * @brief GETs a URL and parses the JSON body while it streams in.
+ *
+ * @param url The URL to fetch.
+ * @param doc Receives the parsed (filtered) JSON.
+ * @param filter_json ArduinoJson filter: only these fields are kept.
+ * @param error Set to a short error code on failure.
+ * @return True on success.
+ */
+bool HttpGetJson(const String& url, JsonDocument& doc, const char* filter_json,
+                 String& error) {
   if (WiFi.status() != WL_CONNECTED) {
-    return "";
+    error = "wifi-disconnected";
+    return false;
   }
 
+  WiFiClientSecure client;
+  client.setInsecure();
   HTTPClient http;
-  String url = URL_BASE + rbl_id;
+  // HTTP/1.0 avoids chunked transfer encoding, so the body can be parsed
+  // straight from the socket instead of being buffered in RAM first.
+  http.useHTTP10(true);
+  http.setTimeout(8000);
+  if (!http.begin(client, url)) {
+    error = "http-begin-failed";
+    return false;
+  }
 
-  // Print the URL to the serial port
-  Serial.println(url);
-
-  // Start the HTTP request
-  http.begin(url);
-
-  // Get the status code of the response
-  int httpCode = http.GET();
-
-  // Print the status code to the serial port
-  Serial.print("HTTP status code: ");
-  Serial.println(httpCode);
-
-  // Check if the request was successful
-  if (httpCode <= 0) {
-    // The request failed
-    Serial.println("Error on HTTP request");
-  } else if (httpCode == HTTP_CODE_OK) {
-    // The request was successful
-    // Get the response payload as a string
-    String payload = http.getString();
+  const int http_code = http.GET();
+  if (http_code != HTTP_CODE_OK) {
+    error = http_code <= 0 ? String("http-") + http.errorToString(http_code)
+                           : String("http-status-") + String(http_code);
     http.end();
-    return payload;
+    return false;
+  }
+
+  JsonDocument filter;
+  deserializeJson(filter, filter_json);
+  DeserializationError json_error =
+    deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter),
+                    DeserializationOption::NestingLimit(20));
+  http.end();
+  if (json_error) {
+    error = String("json-") + json_error.c_str();
+    return false;
+  }
+  return true;
+}
+
+
+/**
+ * @brief Fetches live departures for one or more comma-separated RBL IDs.
+ *
+ * @param rbl_list e.g. "4111" or "4111,4118".
+ * @param out Receives the departures.
+ * @return True if the request succeeded (the result may still be empty).
+ */
+bool FetchDepartures(const String& rbl_list, std::vector<Monitor>& out) {
+  out.clear();
+  if (rbl_list.isEmpty()) {
+    g_last_data_error = "no-rbl";
+    LogWarn(F("fetch-skipped"), String(F("no RBL configured")));
+    return false;
+  }
+
+  String url = MONITOR_URL "activateTrafficInfo=stoerunglang";
+  for (const String& rbl : GetSplittedStrings(rbl_list, ',')) {
+    url += "&rbl=";
+    url += rbl;
+  }
+
+  LogInfo(F("fetch-start"), "rbl=" + rbl_list);
+  JsonDocument doc;
+  String error;
+  if (!HttpGetJson(url, doc, kMonitorFilterJson, error)) {
+    g_last_data_error = error;
+    LogWarn(F("fetch-failed"), error);
+    return false;
+  }
+  g_last_data_error = "";
+  out = GetMonitorsFromJson(doc);
+  return g_last_data_error.isEmpty();
+}
+
+
+// ---------------------------------------------------------------------------
+// Setup screens on the display.
+// ---------------------------------------------------------------------------
+
+#if HAS_ESP_QRCODE
+// esp_qrcode_generate() calls back without a user pointer, so the target
+// rectangle is passed through here.
+struct QrDrawTarget {
+  int x = 0;
+  int y = 0;
+  int max_px = 0;
+  int drawn_px = 0;
+} g_qr_target;
+
+void DrawQrCallback(esp_qrcode_handle_t qrcode) {
+  const int size = esp_qrcode_get_size(qrcode);
+  const int border = 2;  // quiet zone, in modules
+  const int scale = std::max(1, g_qr_target.max_px / (size + 2 * border));
+  const int total = (size + 2 * border) * scale;
+  const int x0 = g_qr_target.x + border * scale;
+  const int y0 = g_qr_target.y + border * scale;
+  tft.fillRect(g_qr_target.x, g_qr_target.y, total, total, TFT_WHITE);
+  for (int y = 0; y < size; ++y) {
+    for (int x = 0; x < size; ++x) {
+      if (esp_qrcode_get_module(qrcode, x, y)) {
+        tft.fillRect(x0 + x * scale, y0 + y * scale, scale, scale, TFT_BLACK);
+      }
+    }
+  }
+  g_qr_target.drawn_px = total;
+}
+#endif
+
+/**
+ * @brief Draws a QR code with a white quiet zone.
+ *
+ * @return The drawn edge length in pixels, or 0 if QR codes are unsupported.
+ */
+int DrawQrCode(const String& text, int x, int y, int max_px) {
+#if HAS_ESP_QRCODE
+  g_qr_target.x = x;
+  g_qr_target.y = y;
+  g_qr_target.max_px = max_px;
+  g_qr_target.drawn_px = 0;
+  esp_qrcode_config_t cfg = {};
+  cfg.display_func = DrawQrCallback;
+  cfg.max_qrcode_version = 6;
+  cfg.qrcode_ecc_level = ESP_QRCODE_ECC_LOW;
+  if (esp_qrcode_generate(&cfg, text.c_str()) != ESP_OK) {
+    return 0;
+  }
+  return g_qr_target.drawn_px;
+#else
+  return 0;
+#endif
+}
+
+/**
+ * @brief Common layout of the setup screens: title, QR code on the left.
+ *
+ * @return X coordinate of the text column right of the QR code.
+ */
+int DrawSetupLayout(const String& title, const String& qr_text) {
+  tft.fillScreen(TFT_BG);
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(TFT_TEXT, TFT_BG);
+  tft.setFreeFont(&FreeSansBold12pt7b);
+  tft.drawString(title, 12, 10);
+  tft.drawFastHLine(12, 38, tft.width() - 24, TFT_ACCENT);
+  const int qr_px = DrawQrCode(qr_text, 12, 48, 150);
+  return qr_px ? 12 + qr_px + 12 : 12;
+}
+
+void DrawSetupTextLine(int x, int& y, const String& text, uint16_t color) {
+  tft.setTextFont(2);
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(color, TFT_BG);
+  tft.drawString(text, x, y);
+  y += 17;
+}
+
+///< Touch area of the "Change Wi-Fi" button on the setup screen.
+bool IsInSetupWifiButton(int x, int y) {
+  return x >= tft.width() - 130 && y >= tft.height() - 48;
+}
+
+/**
+ * @brief Shows how to reach the setup web app. Caller holds dataMutex (or no
+ * other task is running yet).
+ */
+void DrawSetupScreen() {
+  const bool was_visible = g_setup_screen_visible;
+  g_setup_screen_visible = true;
+  g_status_screen_visible = true;
+  g_force_header_redraw = true;
+
+  const bool first_run = global_settings.GetConfiguredCount() == 0;
+  const String ip = WiFi.localIP().toString();
+  const int x = DrawSetupLayout(first_run ? "Add your first stop" : "Setup",
+                                "http://" + ip + "/");
+  int y = 50;
+  DrawSetupTextLine(x, y, "Scan with a phone", TFT_TEXT);
+  DrawSetupTextLine(x, y, "on the same Wi-Fi", TFT_TEXT);
+  DrawSetupTextLine(x, y, "to search stops and", TFT_TEXT);
+  DrawSetupTextLine(x, y, "change settings.", TFT_TEXT);
+  y += 8;
+  DrawSetupTextLine(x, y, "Or open:", TFT_TEXT);
+  DrawSetupTextLine(x, y, ip, TFT_ACCENT);
+  DrawSetupTextLine(x, y, DEVICE_HOSTNAME ".local", TFT_ACCENT);
+
+  const int bw = 118;
+  const int bh = 28;
+  const int bx = tft.width() - bw - 8;
+  const int by = tft.height() - bh - 8;
+  if (!first_run) {
+    int hint_y = by + 6;
+    DrawSetupTextLine(12, hint_y, "Tap to close", TFT_TEXT);
+  }
+  tft.drawRoundRect(bx, by, bw, bh, 6, TFT_ACCENT);
+  tft.setTextFont(2);
+  tft.setTextColor(TFT_TEXT, TFT_BG);
+  tft.setTextDatum(MC_DATUM);
+  tft.drawString("Change Wi-Fi", bx + bw / 2, by + bh / 2);
+  tft.setTextDatum(TL_DATUM);
+
+  if (!was_visible) {
+    LogInfo(F("setup-screen"), "http://" + ip + "/");
+  }
+}
+
+void ShowSetupScreen() {
+  if (dataMutex && xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
+    DrawSetupScreen();
+    xSemaphoreGive(dataMutex);
+  } else {
+    DrawSetupScreen();
+  }
+}
+
+void CloseSetupScreen() {
+  g_setup_screen_visible = false;
+  ApplyProfileChange();
+}
+
+/**
+ * @brief Shown while the Wi-Fi hotspot is open (first boot / Wi-Fi change).
+ */
+void DrawWifiPortalScreen() {
+  const bool locked =
+    dataMutex && xSemaphoreTake(dataMutex, pdMS_TO_TICKS(1000)) == pdTRUE;
+  g_status_screen_visible = true;
+  g_force_header_redraw = true;
+
+  const String ssid = StringDatabase::GetWiFissid();
+  // Standard Wi-Fi QR payload: phones offer to join the open hotspot.
+  const int x =
+    DrawSetupLayout("Connect to Wi-Fi", "WIFI:T:nopass;S:" + ssid + ";;");
+  int y = 50;
+  DrawSetupTextLine(x, y, "1. Scan the code or", TFT_TEXT);
+  DrawSetupTextLine(x, y, "   join the Wi-Fi", TFT_TEXT);
+  DrawSetupTextLine(x, y, "   " + ssid, TFT_ACCENT);
+  DrawSetupTextLine(x, y, "2. Pick your home", TFT_TEXT);
+  DrawSetupTextLine(x, y, "   Wi-Fi and enter", TFT_TEXT);
+  DrawSetupTextLine(x, y, "   its password.", TFT_TEXT);
+  y += 8;
+  DrawSetupTextLine(x, y, "Page not opening?", TFT_TEXT);
+  DrawSetupTextLine(x, y, "Go to 192.168.4.1", TFT_ACCENT);
+
+  if (locked) {
+    xSemaphoreGive(dataMutex);
+  }
+}
+
+
+// ---------------------------------------------------------------------------
+// Wi-Fi setup (captive portal). Only Wi-Fi is configured here; stops and
+// settings live in the setup web app on the home network.
+// ---------------------------------------------------------------------------
+
+static const char kPortalHead[] PROGMEM =
+  "<style>"
+  "body{font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;"
+  "background:#f4f5f7;color:#14171a}"
+  ".wrap{max-width:440px}"
+  "h1{font-size:1.6em;margin-bottom:.2em}"
+  "button,input[type=submit]{background:#c8102e;border-radius:10px;"
+  "font-weight:600}"
+  "button.D{background:#6b7280}"
+  "input,select{border-radius:10px;border:1px solid #d0d5dc;padding:10px;"
+  "font-size:16px}"
+  "a{color:#c8102e}"
+  "@media(prefers-color-scheme:dark){body{background:#0b0d10;color:#f3f4f6}"
+  "input,select{background:#16191e;color:#f3f4f6;border-color:#2a2f37}}"
+  "</style>";
+
+/**
+ * @brief Connects to Wi-Fi, opening the Wi-Fi setup hotspot when needed.
+ *
+ * @param force_config_portal Open the hotspot even though Wi-Fi works (used to
+ * change networks at runtime).
+ */
+void WiFiManagerTask(bool force_config_portal) {
+  WiFiManager wifiManager;
+  wifiManager.setDebugOutput(ENABLE_SERIAL_LOGS);
+  wifiManager.setTitle("Wien Monitor");
+  wifiManager.setHostname(DEVICE_HOSTNAME);
+  wifiManager.setCustomHeadElement(kPortalHead);
+  std::vector<const char*> menu = { "wifi", "info", "exit" };
+  wifiManager.setMenu(menu);
+  wifiManager.setShowInfoUpdate(false);
+  wifiManager.setConnectTimeout(20);
+  wifiManager.setAPCallback([](WiFiManager*) {
+    DrawWifiPortalScreen();
+  });
+
+  const String ssid = StringDatabase::GetWiFissid();
+  bool connected = false;
+  if (force_config_portal) {
+    // Close the hotspot again if nobody uses it; it costs a lot of power.
+    wifiManager.setConfigPortalTimeout(300);
+    LogInfo(F("config-portal-open"));
+    connected = wifiManager.startConfigPortal(ssid.c_str());
+    if (WiFi.status() != WL_CONNECTED) {
+      // Cancelled or timed out: go back to the previous network.
+      WiFi.mode(WIFI_STA);
+      WiFi.begin();
+      connected = WaitForWifi(10000);
+    }
+  } else {
+    if (wifiManager.getWiFiIsSaved()) {
+      // With saved credentials, a failed connect (router still booting after
+      // a power cut, ...) should retry via reboot, not leave the hotspot open.
+      wifiManager.setConfigPortalTimeout(180);
+      ShowStatusScreen("Connecting to Wi-Fi", "");
+    }
+    connected = wifiManager.autoConnect(ssid.c_str());
+  }
+
+  if (!connected) {
+    LogError(F("wifi-config-failed"));
+    if (!force_config_portal) {
+      ESP.restart();
+    }
+  } else {
+    LogInfo(F("wifi-ready"), WiFi.SSID());
+  }
+}
+
+
+// ---------------------------------------------------------------------------
+// Stop search index.
+//
+// Wiener Linien publish every platform ("Haltepunkt") as open data. A trimmed
+// copy is kept in flash - one "diva;rbl;name;municipality" line per platform,
+// plus a "#<timestamp>;<count>" footer - so the setup app can search stops by
+// name instead of asking for RBL numbers.
+// ---------------------------------------------------------------------------
+
+static constexpr unsigned long kStopIndexMaxAgeS = 30UL * 24UL * 60UL * 60UL;
+static constexpr unsigned long kStopIndexRetryMs = 10UL * 60UL * 1000UL;
+unsigned long g_last_index_attempt_ms = 0;
+bool g_index_attempted = false;
+
+/**
+ * @brief Calls fn(line) for every line of a file, reading in blocks.
+ */
+template<typename Fn>
+void ForEachFileLine(File& file, Fn&& fn) {
+  uint8_t buf[512];
+  char line[200];
+  size_t len = 0;
+  while (true) {
+    const int n = file.read(buf, sizeof(buf));
+    if (n <= 0) {
+      break;
+    }
+    for (int i = 0; i < n; ++i) {
+      const char c = static_cast<char>(buf[i]);
+      if (c == '\n') {
+        line[len] = '\0';
+        fn(line);
+        len = 0;
+      } else if (c != '\r' && len < sizeof(line) - 1) {
+        line[len++] = c;
+      }
+    }
+  }
+  if (len) {
+    line[len] = '\0';
+    fn(line);
+  }
+}
+
+/**
+ * @brief Splits a line in place at ';'.
+ *
+ * @return Number of fields found (at most max_fields; the rest of the line is
+ * cut off).
+ */
+int SplitFields(char* line, char** fields, int max_fields) {
+  int count = 0;
+  fields[count++] = line;
+  for (char* p = line; *p; ++p) {
+    if (*p == ';') {
+      *p = '\0';
+      if (count == max_fields) {
+        break;
+      }
+      fields[count++] = p + 1;
+    }
+  }
+  return count;
+}
+
+struct StopIndexInfo {
+  bool exists = false;
+  uint32_t stamp = 0;
+  int count = 0;
+};
+
+/**
+ * @brief Reads the "#<timestamp>;<count>" footer of an index file.
+ */
+StopIndexInfo ReadIndexInfo(const char* path) {
+  StopIndexInfo info;
+  if (!SPIFFS.exists(path)) {
+    return info;
+  }
+  File file = SPIFFS.open(path, "r");
+  if (!file) {
+    return info;
+  }
+  const size_t size = file.size();
+  file.seek(size > 48 ? size - 48 : 0);
+  String tail = file.readString();
+  file.close();
+  const int hash = tail.lastIndexOf('#');
+  if (hash >= 0) {
+    info.exists = true;
+    info.stamp = strtoul(tail.c_str() + hash + 1, nullptr, 10);
+    const int sep = tail.indexOf(';', hash);
+    if (sep > 0) {
+      info.count = tail.substring(sep + 1).toInt();
+    }
+  }
+  return info;
+}
+
+bool IndexNeedsRefresh(const char* path, int min_count) {
+  const StopIndexInfo info = ReadIndexInfo(path);
+  if (!info.exists || info.count < min_count) {
+    return true;
+  }
+  const time_t now = time(nullptr);
+  if (now < 1600000000) {
+    return false;  // clock not set; can't tell the age
+  }
+  return info.stamp < 1600000000
+         || static_cast<unsigned long>(now - info.stamp) > kStopIndexMaxAgeS;
+}
+
+/**
+ * @brief Downloads a CSV file and calls fn(line) for every line without
+ * holding the file in memory. fn returns false to abort (and sets error).
+ */
+template<typename Fn>
+bool StreamCsvLines(const char* url, String& error, Fn&& fn) {
+  if (WiFi.status() != WL_CONNECTED) {
+    error = "wifi-disconnected";
+    return false;
+  }
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.useHTTP10(true);
+  http.setTimeout(10000);
+  if (!http.begin(client, url)) {
+    error = "http-begin-failed";
+    return false;
+  }
+  const int http_code = http.GET();
+  if (http_code != HTTP_CODE_OK) {
+    error = http_code <= 0 ? String("http-") + http.errorToString(http_code)
+                           : String("http-status-") + String(http_code);
+    http.end();
+    return false;
+  }
+
+  NetworkClient& stream = http.getStream();
+  uint8_t buf[512];
+  char line[200];
+  size_t len = 0;
+  bool ok = true;
+  unsigned long last_data_ms = millis();
+  while (ok) {
+    const int available = stream.available();
+    if (available > 0) {
+      const int n = stream.read(buf, std::min(available, static_cast<int>(sizeof(buf))));
+      for (int i = 0; i < n && ok; ++i) {
+        const char c = static_cast<char>(buf[i]);
+        if (c == '\n') {
+          line[len] = '\0';
+          ok = fn(line);
+          len = 0;
+        } else if (c != '\r' && len < sizeof(line) - 1) {
+          line[len++] = c;
+        }
+      }
+      last_data_ms = millis();
+      vTaskDelay(1);  // let the idle task (watchdog) run
+    } else if (!stream.connected()) {
+      break;
+    } else if (millis() - last_data_ms > 10000) {
+      error = "timeout";
+      ok = false;
+    } else {
+      vTaskDelay(pdMS_TO_TICKS(5));
+    }
+  }
+  if (ok && len) {
+    line[len] = '\0';
+    ok = fn(line);
   }
   http.end();
-  return "";
+  return ok;
+}
+
+/**
+ * @brief Downloads the platform list and stores the trimmed search index.
+ */
+bool BuildStopIndex(String& error) {
+  g_index_attempted = true;
+  g_last_index_attempt_ms = millis();
+  LogInfo(F("stops-index-start"));
+
+  File out = SPIFFS.open(STOPS_INDEX_TMP_FILE, "w");
+  if (!out) {
+    error = "fs-open-failed";
+    return false;
+  }
+
+  // Source columns: StopID;DIVA;StopText;Municipality;MunicipalityID;Lon;Lat
+  int count = 0;
+  const bool ok = StreamCsvLines(STOPS_INDEX_URL, error, [&](char* line) {
+    char* f[5];
+    const int n = SplitFields(line, f, 5);
+    if (n < 3 || !isdigit(static_cast<unsigned char>(f[0][0]))
+        || !isdigit(static_cast<unsigned char>(f[1][0]))) {
+      return true;  // header or junk
+    }
+    const char* municipality = (n >= 4 && strcmp(f[3], "Wien") != 0) ? f[3] : "";
+    out.printf("%s;%s;%s;%s\n", f[1], f[0], f[2], municipality);
+    ++count;
+    return true;
+  });
+  out.printf("#%lu;%d\n", static_cast<unsigned long>(time(nullptr)), count);
+  out.close();
+
+  if (!ok || count < 100) {
+    if (ok) {
+      error = "too-few-stops";
+    }
+    SPIFFS.remove(STOPS_INDEX_TMP_FILE);
+    LogWarn(F("stops-index-failed"), error + " stops=" + String(count));
+    return false;
+  }
+  SPIFFS.remove(STOPS_INDEX_FILE);
+  SPIFFS.rename(STOPS_INDEX_TMP_FILE, STOPS_INDEX_FILE);
+  LogInfo(F("stops-index-ok"), "stops=" + String(count));
+  return true;
 }
 
 
+// ---------------------------------------------------------------------------
+// Line index.
+//
+// One "name;type;dir1;dir2;other" line per line, where dir1/dir2 list the
+// platforms (RBL) of the longest route in each direction in travel order, and
+// "other" the platforms only served by short or special runs. The setup app
+// uses it to browse lines, to show which lines stop at a station and to offer
+// directions that have no departures right now.
+// ---------------------------------------------------------------------------
+
+struct LineRoute {
+  uint16_t id = 0;
+  String name;
+  String type;
+  std::vector<uint16_t> best[2];  ///< Longest pattern per direction, in order.
+  std::vector<uint16_t> served;   ///< Every platform the line stops at, sorted.
+};
+
+void PrintIdList(File& out, const std::vector<uint16_t>& ids) {
+  for (size_t i = 0; i < ids.size(); ++i) {
+    if (i) {
+      out.print(',');
+    }
+    out.print(ids[i]);
+  }
+}
+
 /**
- * @brief Manages Wi-Fi configuration using WiFiManager.
+ * @brief Downloads the line list and every route, and stores the line index.
  */
-void WiFiManagerTask() {
-  //SmartWatch sm(__FUNCTION__);
-  WiFiManager wifiManager;
-  wifiManager.setDebugOutput(true);
-  //const char* custom_html = "<style>button{background-color:red;}</style>";
-  //wifiManager.setCustomHeadElement(custom_html);
+bool BuildLineIndex(String& error) {
+  LogInfo(F("lines-index-start"));
 
-  // Load saved configuration
-  const Config& old_config = global_settings.GetConfig();
-  Serial.println("getter");
-  Config new_config;
-  // Convert configuration values to strings
-  const String& rblValue = old_config.GetLinesRblAsString();
-  const String& countValue = old_config.GetLinesCountAsString();
-  const String& filterValue = old_config.GetLinesFilterAsString();
+  // Source columns: LineID;LineText;SortingHelp;Realtime;MeansOfTransport
+  std::vector<LineRoute> lines;
+  if (!StreamCsvLines(LINES_URL, error, [&](char* line) {
+        char* f[5];
+        if (SplitFields(line, f, 5) == 5
+            && isdigit(static_cast<unsigned char>(f[0][0])) && lines.size() < 400) {
+          LineRoute route;
+          route.id = atoi(f[0]);
+          route.name = f[1];
+          route.type = f[4];
+          lines.push_back(std::move(route));
+        }
+        return true;
+      })) {
+    LogWarn(F("lines-index-failed"), error);
+    return false;
+  }
+  if (lines.size() < 10) {
+    error = "too-few-lines";
+    LogWarn(F("lines-index-failed"), error);
+    return false;
+  }
+  std::sort(lines.begin(), lines.end(),
+            [](const LineRoute& a, const LineRoute& b) { return a.id < b.id; });
+  auto find_line = [&](long id) -> LineRoute* {
+    auto it = std::lower_bound(
+      lines.begin(), lines.end(), id,
+      [](const LineRoute& r, long value) { return r.id < value; });
+    return it != lines.end() && it->id == id ? &*it : nullptr;
+  };
 
-  // Create Wi-FiManager parameters
-  WiFiManagerParameter custom_html_elem_hr("<hr>");
-  String cpp_lines_rbl_promt = StringDatabase::GetRBLPrompt();
-
-  String cpp_line_count_promt = StringDatabase::GetLineCountPrompt(
-    Config::cnt_min_lines, Config::cnt_max_lines, Config::cnt_default_lines);
-
-  String cpp_line_filter_promt = StringDatabase::GetLineFilterPrompt();
-  String cpp_ssid = StringDatabase::GetWiFissid();
-  String cpp_instruction = StringDatabase::GetInstructionsText();
-  WiFiManagerParameter rblParam("lines_rbl", cpp_lines_rbl_promt.c_str(),
-                                rblValue.c_str(), 64);
-
-  WiFiManagerParameter countParam("lines_count", cpp_line_count_promt.c_str(),
-                                  countValue.c_str(), 64);
-  WiFiManagerParameter filterParam(
-    "lines_filter", cpp_line_filter_promt.c_str(), filterValue.c_str(), 64);
-
-  // Add parameters to Wi-FiManager
-  wifiManager.addParameter(&rblParam);
-  wifiManager.addParameter(&custom_html_elem_hr);
-  wifiManager.addParameter(&countParam);
-  wifiManager.addParameter(&custom_html_elem_hr);
-  wifiManager.addParameter(&filterParam);
-
-  if (WiFi.psk().length() == 0) {
-    // show screen wifi hint
-    const int FONT_SIZE = global_settings.size_start_instruction_font;
-    tft.setTextSize(0);
-    tft.setTextColor(TFT_TEXT, TFT_BG);
-    tft.setCursor(0, 0, FONT_SIZE);
-    tft.print(cpp_instruction);
+  // Source columns: LineID;PatternID;StopSeqCount;StopID;Direction. The rows
+  // of one pattern come in stop order; some rows lack the direction.
+  LineRoute* route = nullptr;
+  long cur_line = -1;
+  long cur_pattern = -1;
+  int cur_dir = -1;
+  std::vector<uint16_t> pattern;
+  pattern.reserve(64);
+  auto flush = [&]() {
+    if (route && cur_dir >= 0 && pattern.size() > route->best[cur_dir].size()) {
+      route->best[cur_dir] = pattern;
+    }
+    pattern.clear();
+  };
+  const bool ok = StreamCsvLines(ROUTES_URL, error, [&](char* line) {
+    char* f[5];
+    const int n = SplitFields(line, f, 5);
+    if (n < 4 || !isdigit(static_cast<unsigned char>(f[0][0]))
+        || !isdigit(static_cast<unsigned char>(f[3][0]))) {
+      return true;  // header or junk
+    }
+    const long line_id = atol(f[0]);
+    const long pattern_id = atol(f[1]);
+    const int dir = (n >= 5 && (f[4][0] == '1' || f[4][0] == '2')) ? f[4][0] - '1' : -1;
+    if (line_id != cur_line || pattern_id != cur_pattern || dir != cur_dir) {
+      flush();
+      if (line_id != cur_line) {
+        route = find_line(line_id);
+      }
+      cur_line = line_id;
+      cur_pattern = pattern_id;
+      cur_dir = dir;
+    }
+    const long stop = atol(f[3]);
+    if (!route || stop <= 0 || stop > 65535) {
+      return true;
+    }
+    if (ESP.getFreeHeap() < 30000) {
+      error = "low-memory";
+      return false;
+    }
+    const uint16_t id = static_cast<uint16_t>(stop);
+    if (pattern.size() < 160) {
+      pattern.push_back(id);
+    }
+    auto it = std::lower_bound(route->served.begin(), route->served.end(), id);
+    if (it == route->served.end() || *it != id) {
+      route->served.insert(it, id);
+    }
+    return true;
+  });
+  flush();
+  if (!ok) {
+    LogWarn(F("lines-index-failed"), error);
+    return false;
   }
 
-
-  // Attempt to connect to Wi-Fi
-  bool isConnected = wifiManager.autoConnect(cpp_ssid.c_str());
-
-  new_config.SetLinesFilter(filterParam.getValue());
-  new_config.SetLinesRBL(rblParam.getValue());
-  new_config.SetLinesCount(countParam.getValue());
-
-  Serial.println(new_config.GetLinesFilterAsString());
-  Serial.println(new_config.GetLinesRblAsString());
-  Serial.println(new_config.GetLinesCountAsString());
-
-  if (!isConnected) {
-    Serial.println("Failed to connect");
-    ESP.restart();
-  } else {
-    // Save the configuration to EEPROM
-    tft.fillScreen(TFT_BG);
-    if (old_config != new_config) {
-      global_settings.SetConfig(new_config);
+  File out = SPIFFS.open(LINES_INDEX_TMP_FILE, "w");
+  if (!out) {
+    error = "fs-open-failed";
+    return false;
+  }
+  int count = 0;
+  for (const LineRoute& r : lines) {
+    if (r.served.empty()) {
+      continue;  // e.g. S-Bahn lines, which come without route data
     }
-    Serial.println("Saved!");
+    std::vector<uint16_t> other;
+    for (uint16_t id : r.served) {
+      if (std::find(r.best[0].begin(), r.best[0].end(), id) == r.best[0].end()
+          && std::find(r.best[1].begin(), r.best[1].end(), id) == r.best[1].end()) {
+        other.push_back(id);
+      }
+    }
+    out.print(r.name);
+    out.print(';');
+    out.print(r.type);
+    for (int d = 0; d < 2; ++d) {
+      out.print(';');
+      PrintIdList(out, r.best[d]);
+    }
+    out.print(';');
+    PrintIdList(out, other);
+    out.print('\n');
+    ++count;
+  }
+  out.printf("#%lu;%d\n", static_cast<unsigned long>(time(nullptr)), count);
+  out.close();
+
+  if (count < 10) {
+    error = "too-few-lines";
+    SPIFFS.remove(LINES_INDEX_TMP_FILE);
+    LogWarn(F("lines-index-failed"), error);
+    return false;
+  }
+  SPIFFS.remove(LINES_INDEX_FILE);
+  SPIFFS.rename(LINES_INDEX_TMP_FILE, LINES_INDEX_FILE);
+  LogInfo(F("lines-index-ok"), "lines=" + String(count));
+  return true;
+}
+
+/**
+ * @brief Lower-case ASCII with umlauts folded, punctuation turned into spaces,
+ * so "Straße" matches "strasse" and "Karlsplatz U" matches "karlsplatz".
+ */
+String NormalizeForSearch(const char* text) {
+  String out;
+  out.reserve(strlen(text) + 4);
+  for (const unsigned char* p = reinterpret_cast<const unsigned char*>(text); *p;
+       ++p) {
+    const unsigned char c = *p;
+    if (c == 0xC3 && p[1]) {
+      switch (*++p) {
+        case 0xA4:
+        case 0x84: out += 'a'; break;  // ä Ä
+        case 0xB6:
+        case 0x96: out += 'o'; break;  // ö Ö
+        case 0xBC:
+        case 0x9C: out += 'u'; break;  // ü Ü
+        case 0x9F: out += "ss"; break;  // ß
+        case 0xA9:
+        case 0x89: out += 'e'; break;  // é É
+        default: out += ' '; break;
+      }
+    } else if (isalnum(c)) {
+      out += static_cast<char>(tolower(c));
+    } else {
+      out += ' ';
+    }
+  }
+  return out;
+}
+
+struct StopHit {
+  String diva;
+  String name;
+  String municipality;
+  int score;
+};
+
+/**
+ * @brief Searches the stop index. Every word of the query must appear in the
+ * stop name; names starting with the query rank first.
+ */
+std::vector<StopHit> SearchStops(const String& query, size_t limit) {
+  std::vector<StopHit> hits;
+  String normalized_query = NormalizeForSearch(query.c_str());
+  normalized_query.trim();
+  const std::vector<String> tokens = GetSplittedStrings(normalized_query, ' ');
+  if (tokens.empty()) {
+    return hits;
+  }
+  const String query_prefix = String(" ") + normalized_query;
+  const String first_word = String(" ") + tokens[0];
+
+  File file = SPIFFS.open(STOPS_INDEX_FILE, "r");
+  if (!file) {
+    return hits;
+  }
+  ForEachFileLine(file, [&](char* line) {
+    if (line[0] == '#') {
+      return;
+    }
+    char* f[4];
+    const int n = SplitFields(line, f, 4);
+    if (n < 3) {
+      return;
+    }
+    const char* municipality = n >= 4 ? f[3] : "";
+    String haystack = String(" ") + NormalizeForSearch(f[2]) + " "
+                      + NormalizeForSearch(municipality) + " ";
+    for (const String& token : tokens) {
+      if (haystack.indexOf(token) < 0) {
+        return;
+      }
+    }
+    for (const StopHit& hit : hits) {
+      if (hit.diva == f[0]) {
+        return;  // another platform of a station we already have
+      }
+    }
+    if (hits.size() >= 300) {
+      return;
+    }
+    const int score = haystack.startsWith(query_prefix) ? 0
+                      : haystack.indexOf(first_word) >= 0 ? 1
+                                                          : 2;
+    hits.push_back({ String(f[0]), String(f[2]), String(municipality), score });
+  });
+  file.close();
+
+  std::sort(hits.begin(), hits.end(), [](const StopHit& a, const StopHit& b) {
+    if (a.score != b.score) {
+      return a.score < b.score;
+    }
+    if (a.name.length() != b.name.length()) {
+      return a.name.length() < b.name.length();
+    }
+    return a.name < b.name;
+  });
+  if (hits.size() > limit) {
+    hits.erase(hits.begin() + limit, hits.end());
+  }
+  return hits;
+}
+
+/**
+ * @brief All platform IDs (RBL) the offline index lists for a station.
+ */
+std::vector<String> StopIndexRblsForDiva(const String& diva) {
+  std::vector<String> rbls;
+  File file = SPIFFS.open(STOPS_INDEX_FILE, "r");
+  if (!file) {
+    return rbls;
+  }
+  ForEachFileLine(file, [&](char* line) {
+    char* f[3];
+    if (SplitFields(line, f, 3) >= 2 && diva == f[0]) {
+      rbls.push_back(String(f[1]));
+    }
+  });
+  file.close();
+  return rbls;
+}
+
+
+// ---------------------------------------------------------------------------
+// Setup web app (http://wien-monitor.local or the IP shown on the display).
+// ---------------------------------------------------------------------------
+
+WebServer g_web(80);
+
+// Only the fields the station picker needs.
+static const char kStationFilterJson[] =
+  "{\"data\":{\"monitors\":[{"
+  "\"locationStop\":{\"properties\":{\"title\":true,\"attributes\":{\"rbl\":true}}},"
+  "\"lines\":[{\"name\":true,\"towards\":true,\"type\":true,"
+  "\"departures\":{\"departure\":[{\"departureTime\":{\"countdown\":true}}]}}]"
+  "}],"
+  "\"trafficInfos\":[{\"title\":true,\"description\":true,\"relatedLines\":true}]}}";
+
+void NoteWebActivity() {
+  g_last_web_ms = millis();
+}
+
+void SendJson(JsonDocument& doc, int code = 200) {
+  String body;
+  serializeJson(doc, body);
+  g_web.sendHeader("Cache-Control", "no-store");
+  g_web.send(code, "application/json", body);
+}
+
+void SendJsonError(int code, const String& message) {
+  JsonDocument doc;
+  doc["error"] = message;
+  SendJson(doc, code);
+}
+
+bool ParseJsonBody(JsonDocument& doc) {
+  if (!g_web.hasArg("plain")) {
+    return false;
+  }
+  return !deserializeJson(doc, g_web.arg("plain"));
+}
+
+void FillStateJson(JsonDocument& doc) {
+  JsonArray profiles_json = doc["profiles"].to<JsonArray>();
+  int active_pos = -1;
+  if (xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
+    const std::vector<Config>& profiles = global_settings.GetProfiles();
+    const int active = global_settings.GetActiveIndex();
+    for (int i = 0; i < static_cast<int>(profiles.size()); ++i) {
+      const Config& cfg = profiles[i];
+      if (!cfg.IsConfigured()) {
+        continue;
+      }
+      if (i == active) {
+        active_pos = profiles_json.size();
+      }
+      JsonObject obj = profiles_json.add<JsonObject>();
+      obj["name"] = cfg.GetName();
+      obj["rbl"] = cfg.GetLinesRblAsString();
+      obj["filter"] = cfg.GetLinesFilterAsString();
+      obj["rows"] = cfg.GetLinesCountAsInt();
+      obj["diva"] = cfg.GetDiva();
+      obj["badges"] = cfg.GetBadges();
+
+      // Last departures fetched for this stop, so the app can show them
+      // without another request to Wiener Linien.
+      const CachedTraffic& cache = g_traffic_cache[i];
+      const unsigned long age_ms = millis() - cache.fetched_ms;
+      if (cache.valid && age_ms <= kTrafficCacheMaxAgeMs) {
+        const int age_min = static_cast<int>(age_ms / 60000UL);
+        obj["age"] = static_cast<int>(age_ms / 1000UL);
+        JsonArray live = obj["live"].to<JsonArray>();
+        for (const Monitor& monitor : cache.monitors) {
+          if (live.size() >= 6) {
+            break;
+          }
+          JsonObject row = live.add<JsonObject>();
+          row["l"] = monitor.name;
+          row["t"] = monitor.towards;
+          JsonArray next = row["c"].to<JsonArray>();
+          for (int countdown : monitor.countdown) {
+            if (next.size() >= 3) {
+              break;
+            }
+            next.add(std::max(0, countdown - age_min));
+          }
+          if (monitor.description.length()) {
+            row["d"] = monitor.description;
+          }
+        }
+      }
+    }
+    xSemaphoreGive(dataMutex);
+  }
+  doc["active"] = active_pos;
+
+  const DisplayPrefs prefs = global_settings.GetPrefs();
+  JsonObject settings = doc["settings"].to<JsonObject>();
+  settings["brightness"] = prefs.brightness_pct;
+  settings["dim"] = prefs.dim_after_s;
+  settings["off"] = prefs.off_after_s;
+
+  const StopIndexInfo index = ReadIndexInfo(STOPS_INDEX_FILE);
+  const StopIndexInfo line_index = ReadIndexInfo(LINES_INDEX_FILE);
+  JsonObject device = doc["device"].to<JsonObject>();
+  device["ssid"] = WiFi.SSID();
+  device["ip"] = WiFi.localIP().toString();
+  device["host"] = DEVICE_HOSTNAME ".local";
+  device["rssi"] = WiFi.RSSI();
+  device["heap"] = ESP.getFreeHeap();
+  device["uptime"] = millis() / 1000;
+  device["stops"] = index.exists ? index.count : 0;
+  device["stopsDate"] = index.stamp;
+  device["lines"] = line_index.exists ? line_index.count : 0;
+  device["linesDate"] = line_index.stamp;
+  device["now"] = static_cast<uint32_t>(time(nullptr));
+
+  JsonObject limits = doc["limits"].to<JsonObject>();
+  limits["maxStops"] = kProfileCount;
+  limits["maxRows"] = Config::cnt_max_lines;
+  limits["maxIds"] = Config::kMaxRblIds;
+}
+
+void HandleRoot() {
+  NoteWebActivity();
+  g_web.sendHeader("Cache-Control", "no-cache");
+  g_web.send_P(200, "text/html", kSetupPageHtml);
+}
+
+void HandleState() {
+  NoteWebActivity();
+  JsonDocument doc;
+  FillStateJson(doc);
+  SendJson(doc);
+}
+
+void HandlePing() {
+  NoteWebActivity();
+  JsonDocument doc;
+  doc["ok"] = true;
+  SendJson(doc);
+}
+
+void HandleSaveProfiles() {
+  NoteWebActivity();
+  JsonDocument body;
+  if (!ParseJsonBody(body) || !body["profiles"].is<JsonArray>()) {
+    SendJsonError(400, "invalid request");
+    return;
+  }
+
+  std::vector<Config> list;
+  for (JsonVariantConst obj : body["profiles"].as<JsonArrayConst>()) {
+    if (static_cast<int>(list.size()) >= kProfileCount) {
+      break;
+    }
+    Config cfg;
+    String name = obj["name"] | "";
+    if (name.length() > 40) {
+      name = name.substring(0, 40);
+    }
+    cfg.SetName(name);
+    cfg.SetLinesRBL(obj["rbl"] | "");
+    cfg.SetLinesFilter(obj["filter"] | "");
+    cfg.SetLinesCount(JsonToInt(obj["rows"], Config::cnt_default_lines));
+    cfg.SetDiva(obj["diva"] | "");
+    cfg.SetBadges(obj["badges"] | "");
+    if (cfg.IsConfigured()) {
+      list.push_back(cfg);
+    }
+  }
+  const int active = JsonToInt(body["active"], 0);
+
+  if (xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
+    global_settings.SetProfiles(list, active);
+    ClearTrafficCache();
+    xSemaphoreGive(dataMutex);
+  }
+  LogInfo(F("web-profiles-saved"), "stops=" + String(list.size()));
+
+  // Show the result right away (this also closes the first-run screen).
+  g_setup_screen_visible = false;
+  ApplyProfileChange();
+  WakeDisplayIfNeeded();
+  HandleState();
+}
+
+void HandleSaveSettings() {
+  NoteWebActivity();
+  JsonDocument body;
+  if (!ParseJsonBody(body)) {
+    SendJsonError(400, "invalid request");
+    return;
+  }
+  DisplayPrefs prefs = global_settings.GetPrefs();
+  prefs.brightness_pct = JsonToInt(body["brightness"], prefs.brightness_pct);
+  prefs.dim_after_s = JsonToInt(body["dim"], prefs.dim_after_s);
+  prefs.off_after_s = JsonToInt(body["off"], prefs.off_after_s);
+  global_settings.SetPrefs(prefs);
+
+  // Show the new brightness immediately.
+  WakeDisplayIfNeeded();
+  if (g_display_awake && !g_backlight_dimmed) {
+    BacklightSetPct(global_settings.GetPrefs().brightness_pct);
+  }
+  HandleState();
+}
+
+void HandleShow() {
+  NoteWebActivity();
+  JsonDocument body;
+  ParseJsonBody(body);
+  const int position = JsonToInt(body["index"], -1);
+
+  bool changed = false;
+  if (xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
+    const std::vector<Config>& profiles = global_settings.GetProfiles();
+    int seen = 0;
+    for (int i = 0; i < static_cast<int>(profiles.size()); ++i) {
+      if (!profiles[i].IsConfigured()) {
+        continue;
+      }
+      if (seen++ == position) {
+        changed = global_settings.SetActiveIndex(i);
+        break;
+      }
+    }
+    xSemaphoreGive(dataMutex);
+  }
+
+  WakeDisplayIfNeeded();
+  if (changed || g_setup_screen_visible) {
+    g_setup_screen_visible = false;
+    ApplyProfileChange();
+  }
+  HandleState();
+}
+
+void HandleSearch() {
+  NoteWebActivity();
+  if (!SPIFFS.exists(STOPS_INDEX_FILE)) {
+    String error;
+    if (!BuildStopIndex(error)) {
+      SendJsonError(503, String("The stop list could not be downloaded (")
+                           + error + ")");
+      return;
+    }
+  }
+  const std::vector<StopHit> hits = SearchStops(g_web.arg("q"), 12);
+  JsonDocument doc;
+  JsonArray results = doc["results"].to<JsonArray>();
+  for (const StopHit& hit : hits) {
+    JsonObject obj = results.add<JsonObject>();
+    obj["diva"] = hit.diva;
+    obj["name"] = hit.name;
+    obj["muni"] = hit.municipality;
+  }
+  SendJson(doc);
+}
+
+void HandleStation() {
+  NoteWebActivity();
+  const String diva = g_web.arg("diva");
+  bool valid = diva.length() > 0 && diva.length() <= 12;
+  for (size_t i = 0; i < diva.length() && valid; ++i) {
+    valid = isdigit(static_cast<unsigned char>(diva[i]));
+  }
+  if (!valid) {
+    SendJsonError(400, "invalid station");
+    return;
+  }
+
+  JsonDocument live;
+  String error;
+  const bool live_ok = HttpGetJson(String(MONITOR_URL) + "diva=" + diva, live,
+                                   kStationFilterJson, error);
+
+  JsonDocument doc;
+  JsonArray platforms = doc["platforms"].to<JsonArray>();
+  auto find_platform = [&](long rbl) {
+    for (JsonObject platform : platforms) {
+      if ((platform["rbl"] | 0L) == rbl) {
+        return platform;
+      }
+    }
+    return JsonObject();
+  };
+
+  if (live_ok) {
+    for (JsonVariant monitor : live["data"]["monitors"].as<JsonArray>()) {
+      JsonVariant properties = monitor["locationStop"]["properties"];
+      const long rbl = properties["attributes"]["rbl"] | 0L;
+      if (rbl <= 0) {
+        continue;
+      }
+      JsonObject platform = find_platform(rbl);
+      if (platform.isNull()) {
+        platform = platforms.add<JsonObject>();
+        platform["rbl"] = rbl;
+        platform["title"] = properties["title"] | "";
+        platform["lines"].to<JsonArray>();
+      }
+      JsonArray lines = platform["lines"];
+      for (JsonVariant line : monitor["lines"].as<JsonArray>()) {
+        JsonObject entry = lines.add<JsonObject>();
+        entry["name"] = line["name"] | "";
+        entry["towards"] = TitleCaseSingleWord(line["towards"] | "");
+        entry["type"] = line["type"] | "";
+        JsonArray next = entry["next"].to<JsonArray>();
+        auto add_next = [&](JsonVariant item) {
+          JsonVariant countdown = item["departureTime"]["countdown"];
+          if (next.size() < 3 && countdown.is<int>()) {
+            next.add(countdown.as<int>());
+          }
+        };
+        JsonVariant departure = line["departures"]["departure"];
+        if (departure.is<JsonArray>()) {
+          for (JsonVariant item : departure.as<JsonArray>()) {
+            add_next(item);
+          }
+        } else if (departure.is<JsonObject>()) {
+          add_next(departure);
+        }
+      }
+    }
+
+    // Disruptions and notices for the lines at this station.
+    JsonArray alerts = doc["alerts"].to<JsonArray>();
+    for (JsonVariant info : live["data"]["trafficInfos"].as<JsonArray>()) {
+      if (alerts.size() >= 8) {
+        break;
+      }
+      JsonObject alert = alerts.add<JsonObject>();
+      alert["title"] = info["title"] | "";
+      alert["text"] = info["description"] | "";
+      JsonArray related = alert["lines"].to<JsonArray>();
+      for (JsonVariant line : info["relatedLines"].as<JsonArray>()) {
+        related.add(line.as<const char*>());
+      }
+    }
+  }
+
+  // Platforms without departures right now only appear in the offline list.
+  for (const String& rbl : StopIndexRblsForDiva(diva)) {
+    const long id = rbl.toInt();
+    if (id > 0 && find_platform(id).isNull()) {
+      JsonObject platform = platforms.add<JsonObject>();
+      platform["rbl"] = id;
+      platform["lines"].to<JsonArray>();
+    }
+  }
+
+  if (!live_ok && platforms.size() == 0) {
+    SendJsonError(502, String("Live data unavailable (") + error + ")");
+    return;
+  }
+  doc["live"] = live_ok;
+  SendJson(doc);
+}
+
+void HandleStopsUpdate() {
+  NoteWebActivity();
+  String error;
+  if (!BuildStopIndex(error)) {
+    SendJsonError(502, String("Stop list download failed (") + error + ")");
+    return;
+  }
+  if (!BuildLineIndex(error)) {
+    SendJsonError(502, String("Line data download failed (") + error + ")");
+    return;
+  }
+  HandleState();
+}
+
+/**
+ * @brief Sends one of the offline index files as is; the app parses and
+ * caches it so it can search and browse without further requests.
+ */
+void SendIndexFile(const char* path) {
+  NoteWebActivity();
+  File file = SPIFFS.open(path, "r");
+  if (!file) {
+    SendJsonError(404, "not downloaded yet");
+    return;
+  }
+  g_web.sendHeader("Cache-Control", "no-store");
+  g_web.streamFile(file, "text/plain; charset=utf-8");
+  file.close();
+}
+
+void HandleStopsData() {
+  SendIndexFile(STOPS_INDEX_FILE);
+}
+
+void HandleLinesData() {
+  SendIndexFile(LINES_INDEX_FILE);
+}
+
+void HandleWifiPortal() {
+  NoteWebActivity();
+  JsonDocument doc;
+  doc["ok"] = true;
+  SendJson(doc);
+  // WebTask starts the portal after this response has been sent.
+  g_request_wifi_portal = true;
+}
+
+void HandleNotFound() {
+  if (g_web.uri().startsWith("/api/")) {
+    SendJsonError(404, "not found");
+    return;
+  }
+  g_web.sendHeader("Location", "/");
+  g_web.send(302, "text/plain", "");
+}
+
+void RegisterWebRoutes() {
+  g_web.on("/", HTTP_GET, HandleRoot);
+  g_web.on("/api/state", HTTP_GET, HandleState);
+  g_web.on("/api/ping", HTTP_GET, HandlePing);
+  g_web.on("/api/profiles", HTTP_POST, HandleSaveProfiles);
+  g_web.on("/api/settings", HTTP_POST, HandleSaveSettings);
+  g_web.on("/api/show", HTTP_POST, HandleShow);
+  g_web.on("/api/search", HTTP_GET, HandleSearch);
+  g_web.on("/api/station", HTTP_GET, HandleStation);
+  g_web.on("/api/stops/update", HTTP_POST, HandleStopsUpdate);
+  g_web.on("/api/data/stops", HTTP_GET, HandleStopsData);
+  g_web.on("/api/data/lines", HTTP_GET, HandleLinesData);
+  g_web.on("/api/wifi", HTTP_POST, HandleWifiPortal);
+  g_web.onNotFound(HandleNotFound);
+}
+
+/**
+ * @brief Runs the setup web server while the display is awake and WiFi is up,
+ * and keeps the stop search index fresh.
+ */
+void WebTask(void* pvParameters) {
+  bool running = false;
+  const unsigned long started_ms = millis();
+
+  while (true) {
+    const bool can_run = g_display_awake && !g_config_portal_open
+                         && WiFi.status() == WL_CONNECTED;
+    if (can_run && !running) {
+      g_web.begin();
+      running = true;
+      g_web_server_stopped = false;
+      LogInfo(F("web-started"), "http://" + WiFi.localIP().toString() + "/");
+    } else if (!can_run && running) {
+      g_web.stop();
+      running = false;
+    }
+    if (!running) {
+      g_web_server_stopped = true;
+      vTaskDelay(pdMS_TO_TICKS(100));
+      continue;
+    }
+
+    g_web.handleClient();
+
+    if (g_request_wifi_portal) {
+      g_request_wifi_portal = false;
+      vTaskDelay(pdMS_TO_TICKS(300));  // let the response reach the phone
+      g_web.stop();
+      running = false;
+      g_web_server_stopped = true;
+      StartRuntimeConfigPortal();
+      continue;
+    }
+
+    // Download the stop list and line data on first boot and refresh them
+    // about monthly.
+    if (millis() - started_ms > 5000
+        && (!g_index_attempted
+            || millis() - g_last_index_attempt_ms > kStopIndexRetryMs)) {
+      g_index_attempted = true;
+      g_last_index_attempt_ms = millis();
+      String error;
+      if (IndexNeedsRefresh(STOPS_INDEX_FILE, 100)) {
+        BuildStopIndex(error);
+      }
+      if (IndexNeedsRefresh(LINES_INDEX_FILE, 10)) {
+        BuildLineIndex(error);
+      }
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(10));
   }
 }
 
@@ -2161,12 +4469,16 @@ void WiFiManagerTask() {
  * @brief Prints system information including free heap memory.
  */
 void PrintSystemInfo() {
+  static unsigned long last_log_ms = 0;
+  if (millis() - last_log_ms < 60000) {
+    return;
+  }
+  last_log_ms = millis();
+
   // Get the free heap memory
   uint32_t freeHeap = ESP.getFreeHeap();
-  Serial.print("FreeHeap:");
-  Serial.print(freeHeap);
-  Serial.print(", ");
-  Serial.println();
+  LogInfo(F("system"), "freeHeap=" + String(freeHeap)
+                         + " wifi=" + String(WiFi.status()));
 }
 
 
@@ -2198,7 +4510,7 @@ void ResetActionsTask(void* pvParameters) {
       if (consecutiveLowReads > soft_threshold
           && consecutiveLowReads <= hard_threshold) {
         // Perform softReset here
-        Serial.println("SOFT RESETTING");
+        LogWarn(F("soft-reset"), String(F("clearing WiFi settings")));
         WiFiManager wifiManager;
         wifiManager.resetSettings();
 
@@ -2210,15 +4522,20 @@ void ResetActionsTask(void* pvParameters) {
     if (consecutiveLowReads > hard_threshold) {
       // Reset WiFi settings and restart the ESP
 
-      Serial.println("HARD RESETTING");
+      LogWarn(F("hard-reset"), String(F("clearing WiFi and stop config")));
       global_settings.DeleteFile();
       WiFiManager wifiManager;
       wifiManager.resetSettings();
 
       ESP.restart();
     }
-    unsigned long currentMillis = millis();
-    if (currentMillis >= global_settings.ms_reboot_interval) {
+
+    // Periodic maintenance reboot, only while nobody is looking. The device
+    // comes back up with the display still off.
+    if (millis() >= static_cast<unsigned long>(global_settings.ms_reboot_interval)
+        && !g_display_awake && !g_config_portal_open) {
+      LogInfo(F("scheduled-reboot"));
+      g_quiet_boot_magic = kQuietBootMagic;
       ESP.restart();
     }
 
@@ -2230,30 +4547,253 @@ void ResetActionsTask(void* pvParameters) {
 
 
 /**
+ * @brief Switches the display to the currently active stop profile.
+ *
+ * Rebuilds the renderer and traffic manager (the new profile may show a
+ * different number of rows), shows cached departures or a loading screen, and
+ * asks the data task to refetch immediately. With no stop configured the setup
+ * screen is shown instead.
+ */
+void ApplyProfileChange() {
+  if (xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
+    g_profile_generation = g_profile_generation + 1;
+    g_force_header_redraw = true;
+
+    delete pTraficManager;
+    pTraficManager = new TraficManager();
+    delete p_screen;
+    p_screen = new Screen(global_settings.GetConfig().GetLinesCountAsInt(),
+                          global_settings.cnt_screen_lines_per_rows);
+
+    if (global_settings.GetConfiguredCount() == 0) {
+      DrawSetupScreen();
+    } else {
+      g_setup_screen_visible = false;
+      tft.fillScreen(TFT_BG);
+      std::vector<Monitor> cachedTraffic;
+      if (GetCachedTraffic(global_settings.GetActiveIndex(), cachedTraffic)) {
+        pTraficManager->update(cachedTraffic);
+        pTraficManager->updateScreen();
+        pTraficManager->updateScreen();
+        DrawHeaderBar();
+      } else {
+        ShowFetchingStopScreen(global_settings.GetConfig());
+      }
+    }
+
+    xSemaphoreGive(dataMutex);
+  }
+  g_force_refresh = true;
+}
+
+
+bool StartRuntimeConfigPortal() {
+  if (g_config_portal_open) {
+    LogWarn(F("config-portal-already-open"));
+    return false;
+  }
+  g_config_portal_open = true;
+  if (!CreateTaskChecked(RuntimeConfigPortalTask, "PortalTask", 16384, 1)) {
+    g_config_portal_open = false;
+    return false;
+  }
+  return true;
+}
+
+
+void RuntimeConfigPortalTask(void* pvParameters) {
+  // The setup web server must release port 80 before WiFiManager takes it.
+  const unsigned long start_ms = millis();
+  while (!g_web_server_stopped && millis() - start_ms < 3000) {
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+  g_setup_screen_visible = false;
+  WakeDisplayIfNeeded();
+
+  WiFi.persistent(true);  // a newly chosen network must be stored
+  WiFiManagerTask(true);
+  WiFi.persistent(false);
+  RememberWifiLink();
+  RestartMdns();
+
+  g_force_header_redraw = true;
+  g_last_touch_ms = millis();
+  g_config_portal_open = false;
+  ApplyProfileChange();
+  vTaskDelete(NULL);
+}
+
+
+/**
+ * @brief Handles a short tap (acted on when the finger lifts).
+ */
+void HandleTap(int x, int y) {
+  if (g_setup_screen_visible) {
+    if (IsInSetupWifiButton(x, y)) {
+      LogInfo(F("touch-wifi-setup"));
+      StartRuntimeConfigPortal();
+    } else if (global_settings.GetConfiguredCount() > 0) {
+      CloseSetupScreen();
+    }
+    return;
+  }
+
+  const int direction = (x >= tft.width() / 2) ? 1 : -1;  // right=next
+  bool changed = false;
+  if (xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
+    changed = global_settings.CycleProfile(direction);
+    xSemaphoreGive(dataMutex);
+  }
+  if (changed) {
+    LogInfo(F("touch-switch"),
+            direction > 0 ? String(F("next stop")) : String(F("previous stop")));
+    ApplyProfileChange();
+  }
+}
+
+
+/**
+ * @brief Dims the backlight and later switches the display off when idle.
+ */
+void UpdateIdlePowerState() {
+  if (!g_display_awake || g_config_portal_open) {
+    return;
+  }
+  const DisplayPrefs prefs = global_settings.GetPrefs();
+  const unsigned long now = millis();
+  const unsigned long idle_touch_ms = now - g_last_touch_ms;
+  const unsigned long idle_ms = std::min(idle_touch_ms, now - g_last_web_ms);
+
+  // Without any stop the setup screen must stay reachable, so never sleep.
+  if (prefs.off_after_s > 0 && idle_ms > prefs.off_after_s * 1000UL
+      && global_settings.GetConfiguredCount() > 0) {
+    if (g_setup_screen_visible) {
+      CloseSetupScreen();
+    }
+    SetDisplayAwake(false);
+    return;
+  }
+
+  if (prefs.dim_after_s > 0 && !g_backlight_dimmed
+      && idle_touch_ms > prefs.dim_after_s * 1000UL) {
+    g_backlight_dimmed = true;
+    BacklightSetPct(prefs.DimmedPct());
+    LogInfo(F("display-dim"));
+  }
+}
+
+
+/**
+ * @brief Watches the touch panel.
+ *
+ * - Tap right/left half: next/previous stop.
+ * - Hold ~1 s anywhere: setup screen (QR code for the setup web app).
+ * - A touch that wakes or un-dims the display does nothing else.
+ *
+ * @param pvParameters Pointer to task-specific parameters (unused).
+ */
+void TouchTask(void* pvParameters) {
+  bool pressed = false;
+  bool tap_allowed = false;
+  bool long_press_done = false;
+  unsigned long press_start_ms = 0;
+  int press_x = 0;
+  int press_y = 0;
+  int release_reads = 0;
+
+  while (true) {
+    UpdateIdlePowerState();
+
+    const bool touched = ts.touched();
+    const unsigned long now = millis();
+    if (touched) {
+      release_reads = 0;
+      g_last_touch_ms = now;
+      if (!pressed) {
+        pressed = true;
+        long_press_done = false;
+        press_start_ms = now;
+        tap_allowed = !g_ignore_touch_until_release && !WakeDisplayIfNeeded();
+        if (tap_allowed) {
+          TS_Point p = ts.getPoint();
+          // Map raw touch values onto screen pixels (rough, but plenty to
+          // tell the halves and the corner button apart).
+          press_x = constrain(map(p.x, TOUCH_RAW_MIN, TOUCH_RAW_MAX, 0, tft.width()),
+                              0, tft.width());
+          press_y = constrain(map(p.y, TOUCH_RAW_MIN, TOUCH_RAW_MAX, 0, tft.height()),
+                              0, tft.height());
+        }
+      } else if (!long_press_done && g_display_awake && !g_config_portal_open
+                 && now - press_start_ms
+                      >= static_cast<unsigned long>(global_settings.ms_long_press)) {
+        long_press_done = true;
+        tap_allowed = false;
+        if (!g_setup_screen_visible) {
+          LogInfo(F("touch-long-press"));
+          ShowSetupScreen();
+        }
+      }
+    } else if (release_reads < 2 && ++release_reads == 2) {
+      // Two untouched reads in a row: the finger really lifted.
+      g_ignore_touch_until_release = false;
+      if (pressed) {
+        pressed = false;
+        if (tap_allowed && !g_config_portal_open) {
+          HandleTap(press_x, press_y);
+        }
+      }
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(g_display_awake ? 30 : 25));
+  }
+}
+
+
+/**
  * @brief Setup function for initializing the application.
  */
 void setup() {
   // Initialize Serial communication
   Serial.begin(115200);
-  Serial.println("APP START");
+  delay(200);
+
+  // After the scheduled maintenance reboot, come back with the display off.
+  const bool quiet_boot = esp_reset_reason() == ESP_RST_SW
+                          && g_quiet_boot_magic == kQuietBootMagic;
+  g_quiet_boot_magic = 0;
+  LogInfo(F("app-start"), quiet_boot ? String(F("quiet")) : String());
+
+  setCpuFrequencyMhz(global_settings.mhz_cpu_awake);
+  dataMutex = xSemaphoreCreateMutex();
+
+  // Initialize SPIFFS (SPI Flash File System)
+  if (!SPIFFS.begin(true)) {
+    LogError(F("spiffs-mount-failed"), String(F("setup")));
+    delay(global_settings.ms_error_resset_delay);
+    ESP.restart();  // Restart the ESP32
+  }
 
   // Initialize TFT display
   tft.begin();
   tft.setRotation(1);
   tft.fillScreen(TFT_BG);
+  BacklightBegin();
+  BacklightSetPct(quiet_boot ? 0 : global_settings.GetPrefs().brightness_pct);
+  g_last_touch_ms = millis();
 
-  // Initialize SPIFFS (SPI Flash File System)
-  if (!SPIFFS.begin(true)) {
-    Serial.println("An error occurred while mounting SPIFFS");
-    delay(global_settings.ms_error_resset_delay);
-    ESP.restart();  // Restart the ESP32
-  }
+  // Initialize the XPT2046 touch controller on its own SPI bus (CYD board).
+  pinMode(XPT2046_IRQ, INPUT);
+  touchSPI.begin(XPT2046_CLK, XPT2046_MISO, XPT2046_MOSI, XPT2046_CS);
+  ts.begin(touchSPI);
+  ts.setRotation(1);
 
   // Create a task for reading the reset button state
-  xTaskCreate(ResetActionsTask, "ResetActionsTask", 2048 * 4, NULL, 1, NULL);
+  CreateTaskChecked(ResetActionsTask, "ResetTask", 4096, 1);
 
-  // Run WiFiManagerTask to manage WiFi connection
+  // Connect to WiFi (opens the Wi-Fi setup hotspot if needed).
   WiFiManagerTask();
+  // From here on reconnects must not rewrite the stored credentials.
+  WiFi.persistent(false);
 
   pTraficManager = new TraficManager;
   p_screen = new Screen(global_settings.GetConfig().GetLinesCountAsInt(),
@@ -2261,17 +4801,40 @@ void setup() {
 
   // Check if WiFi is successfully connected
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("Failed to connect to WiFi!");
+    LogError(F("wifi-not-connected"));
     delay(global_settings.ms_error_resset_delay);
     ESP.restart();  // Restart the ESP32
   }
+  LogInfo(F("wifi-connected"), WiFi.localIP().toString());
+  RememberWifiLink();
+  RestartMdns();
+  ConfigureClock();
+  RegisterWebRoutes();
 
-  // Create a mutex for synchronization
-  dataMutex = xSemaphoreCreateMutex();
+  if (global_settings.GetConfiguredCount() == 0) {
+    ShowSetupScreen();
+  } else {
+    tft.fillScreen(TFT_BG);
+    if (quiet_boot) {
+      SetDisplayAwake(false);
+    }
+  }
 
   // Create tasks for data updating and screen updating
-  xTaskCreate(UpdateDataTask, "UpdateDataTask", 2048 * 64, NULL, 2, NULL);
-  xTaskCreate(ScreenUpdateTask, "ScreenUpdateTask", 2048 * 16, NULL, 1, NULL);
+  bool data_task_ok =
+    CreateTaskChecked(UpdateDataTask, "DataTask", 16384, 2);
+  bool screen_task_ok =
+    CreateTaskChecked(ScreenUpdateTask, "ScreenTask", 12288, 1);
+  // Touch: stop switching, long press for setup, waking the display.
+  bool touch_task_ok = CreateTaskChecked(TouchTask, "TouchTask", 8192, 1);
+  // Setup web app and stop search index.
+  bool web_task_ok = CreateTaskChecked(WebTask, "WebTask", 16384, 1);
+
+  if (!data_task_ok || !screen_task_ok || !touch_task_ok || !web_task_ok) {
+    ShowStatusScreen("Task start failed", "Check serial log");
+  } else {
+    LogInfo(F("tasks-started"));
+  }
 }
 
 
@@ -2279,5 +4842,6 @@ void setup() {
  * @brief Main loop function (not actively used in this application).
  */
 void loop() {
-  // This loop is intentionally left empty since the application is task-based.
+  // The application is task-based; just keep this task out of the way.
+  vTaskDelay(portMAX_DELAY);
 }
